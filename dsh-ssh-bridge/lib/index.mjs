@@ -1,17 +1,19 @@
 /**
- * dsh-ssh-bridge — control this DSH from a phone, with no inbound port on the DSH host.
+ * dsh-ssh-bridge — control this DSH from a phone, with no public inbound port on the DSH host.
  *
- * Two transports, one plugin:
+ * Three access modes, one plugin:
  *
  * - ssh   — an outbound SSH connection publishes the DSH listener on the SSH server's
  *             loopback. The phone opens a local forward and browses `127.0.0.1`, which
  *             DSH's trust fence accepts as loopback.
- * - elay — the plugin keeps idle authenticated TLS connections to a relay this package
+ * - relay — the plugin keeps idle authenticated TLS connections to a relay this package
  *             also ships (`bin/dsh-relay.mjs`). The phone just opens the relay's HTTPS URL
  *             in a browser: the relay swaps its access key for a cookie and pipes bytes.
  *
- * Both keep the DSH host free of inbound ports, and both are outbound-only, so no NAT
- * traversal or port punching is involved.
+ * - tailscale — a stable loopback proxy follows the current DSH listener. Tailscale
+ *   Serve publishes it privately to the tailnet, without a separate relay server.
+ *
+ * SSH and relay are outbound-only. Tailscale needs no public inbound listener.
  *
  * See README.md for deployment, the phone procedure, and the security model.
  *
@@ -23,13 +25,14 @@ import path from 'node:path';
 import * as fileSystem from 'node:fs';
 import Schema from '@deepseek-ai/schemastery';
 
-import { buildPairing, buildRelayPairing, describePairing } from './pairing.mjs';
+import { buildPairing, buildRelayPairing, buildTailscalePairing, describePairing } from './pairing.mjs';
 import { renderStatusPage } from './page.mjs';
 import { listDirectory, renderFilesPage, resolveWithin } from './files-page.mjs';
 import { startLocalPage } from './local-page.mjs';
 import { RelayClient } from './relay-client.mjs';
 import { tokenEquals } from './relay-protocol.mjs';
 import { SshTunnel } from './tunnel.mjs';
+import { TailscaleTransport, resolveTailscaleConfig } from './tailscale.mjs';
 
 /** Stable Cordis plugin name. */
 export const name = 'ssh-bridge';
@@ -42,14 +45,20 @@ export const name = 'ssh-bridge';
 
 const AUTH_METHODS = ['auto', 'agent', 'privateKey', 'password'];
 const HOST_KEY_POLICIES = ['strict', 'accept-new', 'insecure'];
-const TRANSPORTS = ['ssh', 'relay'];
+const TRANSPORTS = ['ssh', 'relay', 'tailscale'];
 
 /** Accepted configuration and its defaults. */
 export const Config = Schema.object({
   enabled: Schema.boolean().default(true)
     .description('Keep the configured transport connected and publish this DSH through it.'),
   transport: Schema.union(TRANSPORTS.map((kind) => Schema.const(kind))).default('ssh')
-    .description('"ssh" publishes on an SSH server and needs an SSH client on the phone; "relay" serves HTTPS on one port and needs only a browser.'),
+    .description('"tailscale" uses a private Tailscale Serve URL; "ssh" uses an SSH server; "relay" uses the bundled relay server.'),
+  tailscale: Schema.object({
+    publicUrl: Schema.string().default('')
+      .description('Private HTTPS origin published by Tailscale Serve, for example https://computer.example.ts.net.'),
+    localPort: Schema.natural().min(1).max(65535).default(9301)
+      .description('Stable loopback proxy port. Point Tailscale Serve at http://127.0.0.1:<localPort>.'),
+  }).description('Private access through system Tailscale; no dsh relay server is needed.'),
   ssh: Schema.object({
     host: Schema.string().default('')
       .description('SSH server hostname or IP address. Leave empty to install the plugin without connecting.'),
@@ -132,6 +141,8 @@ export const Config = Schema.object({
   statusPage: Schema.boolean().default(true)
     .description('Register /ssh-bridge and /ssh-bridge/status on the DSH web listener.'),
   files: Schema.object({
+    enabled: Schema.boolean()
+      .description('Expose the authenticated file browser. Defaults to false for Tailscale and true for legacy modes.'),
     root: Schema.string().default('')
       .description('Directory /ssh-bridge/files browses. Empty falls back to the host process directory, which is rarely what you want.'),
   }).description('File browser for other devices.'),
@@ -163,6 +174,7 @@ export function resolveConfig(config = {}) {
   return {
     enabled: config.enabled ?? true,
     transport: TRANSPORTS.includes(config.transport) ? config.transport : 'ssh',
+    tailscale: resolveTailscaleConfig(config.tailscale),
     ssh: {
       host: (ssh.host ?? '').trim(),
       port: ssh.port ?? 22,
@@ -212,6 +224,7 @@ export function resolveConfig(config = {}) {
     },
     statusPage: config.statusPage ?? true,
     files: {
+      enabled: config.files?.enabled ?? config.transport !== 'tailscale',
       root: (config.files?.root ?? '').trim(),
     },
   };
@@ -276,7 +289,7 @@ function readWebTarget(ctx) {
  * @param {string} [accessKey] - Relay access key accepted as an alternative.
  * @returns {boolean} Whether the caller may proceed.
  */
-function isAuthorized(ctx, request, accessKey) {
+function isAuthorized(ctx, request, accessKey, requireConnection = false) {
   if (typeof accessKey === 'string' && accessKey !== '') {
     try {
       const url = new URL(request.url ?? '/', 'http://dsh.invalid');
@@ -287,7 +300,7 @@ function isAuthorized(ctx, request, accessKey) {
   }
 
   const connection = ctx.get?.('connection');
-  if (connection === undefined || typeof connection.admit !== 'function') return true;
+  if (connection === undefined || typeof connection.admit !== 'function') return !requireConnection;
   try {
     return !('rejection' in connection.admit(request));
   } catch {
@@ -314,14 +327,19 @@ export async function apply(ctx, config) {
   const resolved = resolveConfig(config ?? {});
   const log = makeLogger(ctx);
   const mode = resolved.transport;
-
-  const transport = mode === 'relay'
-    ? new RelayClient({ config: resolved, resolveTarget: () => readWebTarget(ctx), log })
-    : new SshTunnel({ config: resolved, resolveTarget: () => readWebTarget(ctx), log });
+  const accessKey = mode === 'tailscale' ? '' : resolved.relay.accessToken;
+  const transports = { ssh: SshTunnel, relay: RelayClient, tailscale: TailscaleTransport };
+  const transport = new transports[mode]({ config: resolved, resolveTarget: () => readWebTarget(ctx), log });
 
   let cachedPairing;
   let cachedAt = 0;
   let announced = false;
+  let disposed = false;
+  const restart = () => {
+    if (!resolved.enabled || disposed) return;
+    cachedPairing = undefined;
+    transport.restart();
+  };
 
   /**
    * Pairing material for the current transport.
@@ -332,6 +350,14 @@ export async function apply(ctx, config) {
     const authenticatedUrl = typeof connection?.authenticatedUrl === 'function'
       ? (url) => connection.authenticatedUrl(url)
       : undefined;
+
+    if (mode === 'tailscale') {
+      if (transport.status().state !== 'forwarding' || authenticatedUrl === undefined) return undefined;
+      if (cachedPairing !== undefined && Date.now() - cachedAt < 60_000) return cachedPairing;
+      cachedPairing = await buildTailscalePairing({ tailscale: resolved.tailscale, authenticatedUrl, qr: resolved.pairing.qr });
+      cachedAt = Date.now();
+      return cachedPairing;
+    }
 
     if (mode === 'relay') {
       if (resolved.relay.host === '') return undefined;
@@ -369,7 +395,9 @@ export async function apply(ctx, config) {
     const material = await pairing().catch(() => undefined);
     if (material === undefined) return;
     announced = true;
-    log('info', `ssh-bridge: ${describePairing(material)}`);
+    log('info', mode === 'tailscale'
+      ? `ssh-bridge: Tailscale entry ${material.url}; pair from the local pairing page`
+      : `ssh-bridge: ${describePairing(material)}`);
   };
 
   /* A fixed loopback address an owner can bookmark. The DSH listener's port is chosen per
@@ -381,7 +409,9 @@ export async function apply(ctx, config) {
       localPage = await startLocalPage({
         host: resolved.pairing.localHost,
         port: resolved.pairing.localPort,
-        accessKey: resolved.relay.accessToken,
+        accessKey,
+        reconnect: resolved.enabled ? restart : undefined,
+        filesUrl: resolved.files.enabled ? undefined : null,
         getStatus: () => transport.status(),
         getPairing: pairing,
         log,
@@ -401,10 +431,7 @@ export async function apply(ctx, config) {
     /** @returns {Promise<object | undefined>} Phone instructions. */
     pairing,
     /** Reconnect from a clean state. */
-    restart: () => {
-      cachedPairing = undefined;
-      transport.restart();
-    },
+    restart,
     /** Stop reconnecting and close the connection. */
     stop: () => transport.stop(),
     /** The underlying transport, for advanced use and tests. */
@@ -418,6 +445,7 @@ export async function apply(ctx, config) {
   }
 
   ctx.effect(() => () => {
+    disposed = true;
     transport.stop();
   }, 'ssh-bridge: transport');
 
@@ -430,7 +458,9 @@ export async function apply(ctx, config) {
   transport.on('ready', () => void announce());
 
   if (resolved.enabled) {
-    if (mode === 'relay') {
+    if (mode === 'tailscale') {
+      transport.start();
+    } else if (mode === 'relay') {
       if (resolved.relay.host === '') {
         log('error', 'ssh-bridge: transport is "relay" but relay.host (or ssh.host) is empty; not connecting');
       } else if (resolved.relay.token === '') {
@@ -456,7 +486,7 @@ export async function apply(ctx, config) {
       kind: 'exact',
       path: '/ssh-bridge/status',
       handler: async (request, response) => {
-        if (!isAuthorized(webCtx, request, resolved.relay.accessToken)) {
+        if (!isAuthorized(webCtx, request, accessKey, mode === 'tailscale')) {
           response.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' });
           response.end('forbidden');
           return;
@@ -493,7 +523,7 @@ export async function apply(ctx, config) {
       kind: 'exact',
       path: '/ssh-bridge',
       handler: async (request, response) => {
-        if (!isAuthorized(webCtx, request, resolved.relay.accessToken)) {
+        if (!isAuthorized(webCtx, request, accessKey, mode === 'tailscale')) {
           response.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' });
           response.end('forbidden');
           return;
@@ -530,8 +560,12 @@ export async function apply(ctx, config) {
         }
 
         let hint;
-        if (!resolved.enabled) hint = 'The bridge is installed but disabled.';
-        else if (mode === 'relay') {
+        if (!resolved.enabled) hint = '连接入口已停用，请在插件配置中启用。';
+        else if (mode === 'tailscale') {
+          hint = resolved.tailscale.publicUrl === ''
+            ? '请配置 Tailscale Serve 地址。'
+            : '等待 DSH Web 服务就绪。';
+        } else if (mode === 'relay') {
           hint = resolved.relay.host === ''
             ? 'relay.host is empty; set it in the plugin configuration.'
             : 'Waiting for the first idle connection to the relay…';
@@ -545,7 +579,7 @@ export async function apply(ctx, config) {
           'content-type': 'text/html; charset=utf-8',
           'cache-control': 'no-store',
         });
-        response.end(renderStatusPage({ status, pairing: material, hint }));
+        response.end(renderStatusPage({ status, pairing: material, hint, reconnectUrl: resolved.enabled ? '/ssh-bridge/reconnect' : null, filesUrl: resolved.files.enabled ? undefined : null }));
       },
     }), 'ssh-bridge: status page');
 
@@ -559,9 +593,14 @@ export async function apply(ctx, config) {
           response.end();
           return;
         }
-        if (!isAuthorized(webCtx, request, resolved.relay.accessToken) || !isSameSite(request)) {
+        if (!isAuthorized(webCtx, request, accessKey, mode === 'tailscale') || !isSameSite(request)) {
           response.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' });
           response.end('forbidden');
+          return;
+        }
+        if (!resolved.enabled) {
+          response.writeHead(409, { 'content-type': 'application/json; charset=utf-8', 'cache-control': 'no-store' });
+          response.end('{"error":"bridge disabled"}\n');
           return;
         }
         cachedPairing = undefined;
@@ -572,13 +611,14 @@ export async function apply(ctx, config) {
         response.end('{"restarting":true}\n');
         /* Restart after the response is flushed: tearing the connection down first would
            cut the very channel carrying this reply. */
-        setTimeout(() => transport.restart(), 150).unref?.();
+        setTimeout(restart, 150).unref?.();
       },
     }), 'ssh-bridge: reconnect route');
 
     /* A file browser for other devices. The chat's file cards are rendered by the desktop
        client and only offer "open with <a local program>", which is meaningless from a phone,
        so this serves the workspace over HTTP with a real attachment download. */
+    if (!resolved.files.enabled) return;
     const filesRoot = resolved.files.root === '' ? process.cwd() : resolved.files.root;
     const filesKey = (request) => {
       try {
@@ -592,7 +632,7 @@ export async function apply(ctx, config) {
       kind: 'prefix',
       path: '/ssh-bridge/files',
       handler: (request, response) => {
-        if (!isAuthorized(webCtx, request, resolved.relay.accessToken)) {
+        if (!isAuthorized(webCtx, request, accessKey, mode === 'tailscale')) {
           response.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' });
           response.end('forbidden');
           return;
@@ -612,7 +652,7 @@ export async function apply(ctx, config) {
         }
         let entries;
         try {
-          entries = listDirectory(target);
+          entries = listDirectory(target, filesRoot);
         } catch {
           response.writeHead(404, { 'content-type': 'text/plain; charset=utf-8' });
           response.end('not found');
@@ -627,7 +667,7 @@ export async function apply(ctx, config) {
       kind: 'exact',
       path: '/ssh-bridge/file',
       handler: (request, response) => {
-        if (!isAuthorized(webCtx, request, resolved.relay.accessToken)) {
+        if (!isAuthorized(webCtx, request, accessKey, mode === 'tailscale')) {
           response.writeHead(403, { 'content-type': 'text/plain; charset=utf-8' });
           response.end('forbidden');
           return;

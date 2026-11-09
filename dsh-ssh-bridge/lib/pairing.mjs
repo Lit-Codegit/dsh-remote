@@ -1,3 +1,5 @@
+import { normalizeTailscalePublicUrl } from './tailscale.mjs';
+
 /**
  * Phone-side pairing material.
  *
@@ -104,12 +106,30 @@ export async function buildRelayPairing({ relay, authenticatedUrl, qr = true }) 
 }
 
 /**
+ * Pair directly with DSH through a private tailnet origin. There is no relay key:
+ * DSH's launch token is exchanged for its normal browser session.
+ * @param {object} options - Pairing inputs.
+ * @param {{publicUrl: string}} options.tailscale - Tailnet origin.
+ * @param {(url: string) => string} [options.authenticatedUrl] - DSH launch-token builder.
+ * @param {boolean} [options.qr] - Whether to render a QR code.
+ * @returns {Promise<object>} Pairing material.
+ */
+export async function buildTailscalePairing({ tailscale, authenticatedUrl, qr = true }) {
+  const url = normalizeTailscalePublicUrl(tailscale.publicUrl);
+  const tokenUrl = typeof authenticatedUrl === 'function' ? authenticatedUrl(url) : undefined;
+  return {
+    mode: 'tailscale', url, tokenUrl,
+    qrDataUrl: qr && tokenUrl !== undefined ? await renderQr(tokenUrl) : undefined,
+  };
+}
+
+/**
  * A short, human-readable summary of where the phone should connect.
  * @param {object} pairing - Result of a pairing builder.
  * @returns {string} Multi-line summary for the host log.
  */
 export function describePairing(pairing) {
-  if (pairing.mode === 'relay') {
+  if (pairing.mode !== 'ssh') {
     return ['phone setup:', `  open: ${pairing.url}`, ...(pairing.tokenUrl === undefined ? [] : [`  first time: ${pairing.tokenUrl}`])].join('\n');
   }
   return [

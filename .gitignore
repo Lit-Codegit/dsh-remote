@@ -2,6 +2,8 @@
 node_modules/
 
 # Android 产物（APK 里内联了访问密钥，绝不能提交）
+android-app/.gradle/
+android-app/**/build/
 *.apk
 *.aab
 *.idsig

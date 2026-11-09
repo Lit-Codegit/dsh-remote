@@ -13,10 +13,48 @@ import fs from 'node:fs';
 import path from 'node:path';
 
 /**
- * Resolve a user-supplied relative path inside a root, refusing escapes.
+ * Whether a normalized path stays inside a normalized root.
+ * @param {string} root - Containing path.
+ * @param {string} target - Candidate path.
+ * @returns {boolean} Whether target is root or one of its descendants.
+ */
+function containsPath(root, target) {
+  const relative = path.relative(root, target);
+  return relative === '' || (relative !== '..' && !relative.startsWith(`..${path.sep}`) && !path.isAbsolute(relative));
+}
+
+/**
+ * Resolve an existing ancestor without accepting dangling symbolic links.
+ * Missing descendants remain valid paths so their routes can return 404.
+ * @param {string} target - Candidate path.
+ * @returns {string | undefined} Physical ancestor, or undefined when it cannot be resolved safely.
+ */
+function realAncestor(target) {
+  let current = target;
+  while (true) {
+    try {
+      return fs.realpathSync(current);
+    } catch (error) {
+      if (error.code !== 'ENOENT' && error.code !== 'ENOTDIR') return undefined;
+      try {
+        /* A dangling link exists lexically, but has no safe physical destination. */
+        fs.lstatSync(current);
+        return undefined;
+      } catch (missing) {
+        if (missing.code !== 'ENOENT' && missing.code !== 'ENOTDIR') return undefined;
+      }
+    }
+    const parent = path.dirname(current);
+    if (parent === current) return undefined;
+    current = parent;
+  }
+}
+
+/**
+ * Resolve a relative or in-root absolute path, checking both lexical and physical boundaries.
  * @param {string} root - Absolute directory that bounds the browse.
- * @param {string} requested - Relative path from the URL.
- * @returns {string | undefined} Absolute path, or undefined when it escapes or is not a directory.
+ * @param {string} requested - Path from the URL.
+ * @returns {string | undefined} Absolute path, or undefined when it escapes or cannot be checked safely.
  */
 export function resolveWithin(root, requested) {
   const base = path.resolve(root);
@@ -25,7 +63,15 @@ export function resolveWithin(root, requested) {
      the host path of a file and should not have to translate it into a relative one. */
   const cleaned = path.isAbsolute(raw) ? raw : raw.replace(/^\/+/, '');
   const target = path.resolve(base, cleaned);
-  if (target !== base && !target.startsWith(`${base}${path.sep}`)) return undefined;
+  if (!containsPath(base, target)) return undefined;
+  let physicalRoot;
+  try {
+    physicalRoot = fs.realpathSync(base);
+  } catch {
+    return undefined;
+  }
+  const physicalTarget = realAncestor(target);
+  if (physicalTarget === undefined || !containsPath(physicalRoot, physicalTarget)) return undefined;
   return target;
 }
 
@@ -49,23 +95,28 @@ export function humanSize(bytes) {
 /**
  * List one directory, newest first, directories before files.
  * @param {string} directory - Absolute directory.
+ * @param {string} [root=directory] - Workspace boundary, including for symbolic links.
  * @returns {{ name: string, dir: boolean, size: number, mtime: number }[]} Entries.
  */
-export function listDirectory(directory) {
+export function listDirectory(directory, root = directory) {
+  const safeDirectory = resolveWithin(root, directory);
+  if (safeDirectory === undefined) throw new Error('outside the workspace');
   const entries = [];
-  for (const entry of fs.readdirSync(directory, { withFileTypes: true })) {
+  for (const entry of fs.readdirSync(safeDirectory, { withFileTypes: true })) {
     if (entry.name.startsWith('.')) continue;
     if (entry.name === 'node_modules') continue;
+    const target = resolveWithin(root, path.join(safeDirectory, entry.name));
+    if (target === undefined) continue;
     let stat;
     try {
-      stat = fs.statSync(path.join(directory, entry.name));
+      stat = fs.statSync(target);
     } catch {
       continue;
     }
     entries.push({
       name: entry.name,
-      dir: entry.isDirectory(),
-      size: entry.isDirectory() ? 0 : stat.size,
+      dir: stat.isDirectory(),
+      size: stat.isDirectory() ? 0 : stat.size,
       mtime: stat.mtimeMs,
     });
   }
@@ -107,10 +158,10 @@ export function renderFilesPage({ relative, entries, key }) {
     const href = entry.dir
       ? `/ssh-bridge/files${query({ d: relative === '' ? entry.name : `${relative}/${entry.name}` })}`
       : `/ssh-bridge/file${query({ p: relative === '' ? entry.name : `${relative}/${entry.name}` })}`;
-    const meta = entry.dir ? '文件夹' : `${humanSize(entry.size)} · ${new Date(entry.mtime).toLocaleString()}`;
+    const meta = entry.dir ? '' : `<span class="meta">${escape(`${humanSize(entry.size)} · ${new Date(entry.mtime).toLocaleString()}`)}</span>`;
     return `  <a class="row" href="${escape(href)}">
     <span class="icon">${entry.dir ? '📁' : '📄'}</span>
-    <span class="body"><span class="name">${escape(entry.name)}</span><span class="meta">${escape(meta)}</span></span>
+    <span class="body"><span class="name">${escape(entry.name)}</span>${meta}</span>
   </a>`;
   }).join('\n');
 
@@ -124,6 +175,8 @@ export function renderFilesPage({ relative, entries, key }) {
  :root{color-scheme:light dark}
  body{font:16px/1.5 -apple-system,BlinkMacSystemFont,"Segoe UI",Roboto,sans-serif;margin:0;
       padding:1rem 1rem 3rem;max-width:34rem;margin-inline:auto}
+ nav{margin:.2rem 0 1rem}
+ nav a{color:inherit;text-decoration:none;font-size:.9rem}
  h1{font-size:1rem;margin:.2rem 0 1rem;opacity:.75;font-weight:600;word-break:break-all}
  .row{display:flex;gap:.75rem;align-items:center;padding:.8rem .9rem;margin-bottom:.5rem;
       border-radius:.8rem;border:1px solid rgba(128,128,128,.28);text-decoration:none;color:inherit}
@@ -134,12 +187,11 @@ export function renderFilesPage({ relative, entries, key }) {
  .meta{font-size:.78rem;opacity:.6;margin-top:.15rem}
  .up{border-style:dashed;opacity:.75}
  .empty{opacity:.6;font-size:.9rem}
- footer{margin-top:1.2rem;font-size:.78rem;opacity:.45;line-height:1.7}
 </style></head><body>
+<nav><a href="/">← 返回 DSH</a></nav>
 <h1>${escape(relative === '' ? '工作区' : relative)}</h1>
 ${up}
 ${rows}
 ${empty}
-<footer>点击文件名直接下载到当前设备。<br>只能浏览工作区内的文件。</footer>
 </body></html>`;
 }

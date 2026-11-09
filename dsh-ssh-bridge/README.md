@@ -1,8 +1,46 @@
 # dsh-ssh-bridge
 
-从手机上控制**任意一台**跑着 DeepSeek Harness 的机器。DSH 侧永远不开入站端口，不做 NAT 穿透、不打洞。
+## Tailscale
 
-两种传输方式，装好之后改一行配置就能切：
+`transport: tailscale` 为当前 DSH Web 提供固定的 `127.0.0.1:9301` 反代入口，Tailscale Serve 将该入口发布到同一 tailnet。DSH 自身的监听端口变化时，无须重新配置 Serve。HTTP、流式响应和 WebSocket 通过代理传递，应用登录仍由 DSH 处理。
+
+```yaml
+- insert:
+    - id: ssh-bridge
+      name: dsh-ssh-bridge
+      config:
+        enabled: true
+        transport: tailscale
+        tailscale:
+          publicUrl: https://computer.example.ts.net
+          localPort: 9301
+        pairing:
+          localHost: 127.0.0.1
+          localPort: 9300
+- id: connection
+  config:
+    trustedHosts: !!js "[...(ctx.webStartup?.trustedHosts ?? []), 'computer.example.ts.net']"
+```
+
+1. 电脑和手机安装并登录同一 Tailscale 网络，使用本机完整的 `*.ts.net` 域名替换示例域名。
+2. 在现有 DSH profile 中加载插件和上述配置。开发时也可把 `name` 写为本地 `lib/index.mjs` 的绝对路径，并先在包目录执行 `npm ci`。
+3. 执行 `tailscale serve --bg --https=443 http://127.0.0.1:9301`，按提示启用 HTTPS。先用 `tailscale serve status` 检查现有配置，避免覆盖其他服务；需要共存时使用其他 HTTPS 端口，并同步 `publicUrl` 和 `trustedHosts` 的端口。
+4. 在电脑打开 `http://127.0.0.1:9300/`。手机连接 Tailscale，扫描二维码，或将配对链接发送到自己的设备后打开。
+5. 登录后收藏 HTTPS 地址。DSH 重启后若登录失效，回到本机配对页重新配对。
+
+Tailscale 模式默认关闭文件浏览与下载接口；只有显式设置 `files.enabled: true` 后才会注册，开启时应同时设置所需的 `files.root`。
+
+本模式不需要 `relay.token` / `relay.accessToken`、SSH 客户端、额外 VPS 或公网监听。配对链接是登录凭据，请只交给自己的设备。`9300` 管理页保持本机可见；Serve 指向 `9301`，不要指向 `9300`。
+
+连接页的“入口已就绪”表示本机反代已启动且 DSH 监听可用，不代表已验证手机、tailnet 权限或 Serve 配置。不能连接时先检查 `tailscale status`、`tailscale serve status` 与手机的 Tailscale 状态。
+
+关闭本入口的 Serve 配置：`tailscale serve --https=443 off`；只在该端口确实用于本插件时执行。插件停用只关闭本机反代，不改动系统 Tailscale 配置。
+
+Tailscale 会自行选择点对点或 DERP 等连接方式。本模式省去 dsh relay，不保证零转发或完全脱离 Tailscale 控制面。参考 [Serve CLI](https://tailscale.com/docs/reference/tailscale-cli/serve)。
+
+## 其他连接方式
+
+以下 SSH / relay 模式通过另一台服务器连接，不需要在 DSH 主机上开放公网入站端口：
 
 | | **relay**（推荐给手机用） | **ssh** |
 |---|---|---|
@@ -200,7 +238,7 @@ ssh -N -L 9100:127.0.0.1:9100 dsh@relay.example.com
 ## 配置
 
 ```yaml
-transport: relay | ssh        # 默认 ssh
+transport: tailscale | relay | ssh  # 默认 ssh
 enabled: true
 ```
 
@@ -208,7 +246,7 @@ enabled: true
 
 | 字段 | 默认 | 说明 |
 |---|---|---|
-| `transport` | `ssh` | 用哪种传输 |
+| `transport` | `ssh` | `tailscale` / `relay` / `ssh` |
 | `enabled` | `true` | 关掉后插件照常装载但不连接 |
 | `pairing.qr` | `true` | 装了可选依赖 `qrcode` 才显示二维码 |
 | `pairing.localPort` | `9300` | 固定的本地配对页端口，`0` 关闭。见下 |
@@ -362,16 +400,16 @@ relay 模式下中继自己还有一个 `GET /__relay/health`（无需认证，�
 
 [dsh-mobile](https://github.com/saya-ch/dsh-mobile) 做的是「手机端的 DSH」：专属触屏布局、Android 原生 App、二维码配对，远程通道走 Tailscale Funnel / cpolar / cloudflared / 自建 FRP。
 
-本项目只做**传输**这一层：
+本项目提供远程入口、配对与连接管理；会话界面继续使用 DSH 自带 UI：
 
 | | dsh-ssh-bridge | dsh-mobile |
 |---|---|---|
-| 远程通道 | 自建 SSH 或本仓库的 relay | 第三方隧道 / FRP |
+| 远程通道 | Tailscale Serve、自建 SSH 或本仓库的 relay | 第三方隧道 / FRP |
 | 手机端 | 浏览器（relay）/ SSH 客户端（ssh） | 专用 Android App / 浏览器 |
 | 触屏布局 | 用 DSH 自带界面 | 重新设计 |
 | 依赖 | `ssh2`、`selfsigned` | `ws`、`selfsigned`、CA、App |
 
-两者不冲突：要触屏布局和 App 就用 dsh-mobile；想要一条**自己能审计、不依赖第三方服务**的通道，用这个。
+两者不冲突。Tailscale 模式依赖 Tailscale 服务；原有 SSH / relay 模式仍可自行部署。
 
 ---
 
@@ -379,7 +417,7 @@ relay 模式下中继自己还有一个 `GET /__relay/health`（无需认证，�
 
 ```bash
 npm install
-npm test        # 44 个测试
+npm test        # 84 个测试
 npm run relay   # 本地起一个中继
 npm run probe   # ssh 模式的传输自检
 ```
@@ -388,7 +426,7 @@ npm run probe   # ssh 模式的传输自检
 
 ### 已验证
 
-- `npm test`：46/46 通过，覆盖主机密钥校验、两种传输的端到端、配对链接、认证拒绝、证书指纹固定、
+- `npm test`：84/84 通过，覆盖主机密钥校验、两种传输的端到端、配对链接、认证拒绝、证书指纹固定、
   重连、以及「连接池排空时排队等待而不是回 503」。
 - 真实 `dsh web`（隔离 `DSH_HOME`）：
   - ssh 模式：插件激活后发布 `127.0.0.1:9393`，模拟手机 `-L` 换 Cookie 后拿到真实 DSH SPA（37 KB, 200）；杀掉 SSH 服务器再以相同密钥重启，转发自动恢复；换密钥则按设计拒绝。

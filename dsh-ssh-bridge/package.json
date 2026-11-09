@@ -2,7 +2,7 @@
   "name": "dsh-ssh-bridge",
   "version": "0.2.0",
   "private": false,
-  "description": "DeepSeek Harness plugin: control DSH from a phone with no inbound port — an SSH remote forward, or a self-hosted relay that carries one or several machines on one port and needs only a browser.",
+  "description": "DeepSeek Harness remote access through Tailscale, SSH forwarding, or a self-hosted relay.",
   "type": "module",
   "main": "./lib/index.mjs",
   "types": "./lib/index.d.mts",
@@ -65,12 +65,13 @@
     "relay",
     "remote-access",
     "mobile",
-    "reverse-tunnel"
+    "reverse-tunnel",
+    "tailscale"
   ],
   "license": "MIT",
   "repository": {
     "type": "git",
-    "url": "https://github.com/your-name/dsh-ssh-bridge.git"
+    "url": "https://github.com/Lit-Codegit/dsh-remote.git"
   },
-  "homepage": "https://github.com/your-name/dsh-ssh-bridge#readme"
+  "homepage": "https://github.com/Lit-Codegit/dsh-remote#readme"
 }

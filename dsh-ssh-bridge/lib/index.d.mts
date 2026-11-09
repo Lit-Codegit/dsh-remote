@@ -23,16 +23,25 @@ export type BridgeState =
 
 /** Configuration accepted by the plugin row. */
 export interface BridgeConfig {
-  /** Transport to publish through. Default `'ssh'`. */
-  transport?: 'ssh' | 'relay';
+  /** Access mode. Default `'ssh'`. */
+  transport?: 'ssh' | 'relay' | 'tailscale';
   /** Keep the transport connected and publish this DSH through it. Default `true`. */
   enabled?: boolean;
+  /** Stable loopback proxy published privately by system Tailscale Serve. */
+  tailscale?: {
+    /** Tailnet origin, normally `https://device.tailnet.ts.net`. */
+    publicUrl?: string;
+    /** Loopback-only proxy port. Default `9301`. */
+    localPort?: number;
+  };
   /** Relay this host publishes through, for `transport: 'relay'`. */
   relay?: {
     /** Relay hostname or IP; empty falls back to `ssh.host`. */
     host?: string;
     /** Relay port. Default `8443`. */
     port?: number;
+    /** Plain HTTP is opt-in. Default `'https'`. */
+    protocol?: 'https' | 'http';
     /** Address the phone uses in the pairing link. */
     publicHost?: string;
     /** Port the phone uses; `0` reuses `port`. */
@@ -49,9 +58,9 @@ export interface BridgeConfig {
     servername?: string;
     /** Accept any relay certificate. Prefer `fingerprint`. */
     insecure?: boolean;
-    /** Idle relay connections kept open. Default `8`. */
+    /** Idle relay connections kept open. Default `32`. */
     poolSize?: number;
-    /** Pool top-up interval, ms. Default `2000`. */
+    /** Pool top-up interval, ms. Default `300`. */
     refreshMs?: number;
     /** Recycle an idle connection older than this, ms. Default `40000`. */
     idleTtlMs?: number;
@@ -112,10 +121,16 @@ export interface BridgeConfig {
   };
   /** Register `/ssh-bridge` and `/ssh-bridge/status`. Default `true`. */
   statusPage?: boolean;
+  /** Directory exposed by the authenticated file browser. */
+  files?: { enabled?: boolean; root?: string };
 }
 
 /** Normalised configuration, defaults applied. */
 export interface ResolvedBridgeConfig extends BridgeConfig {
+  transport: 'ssh' | 'relay' | 'tailscale';
+  enabled: boolean;
+  tailscale: { publicUrl: string; localPort: number };
+  relay: Required<NonNullable<BridgeConfig['relay']>>;
   ssh: Required<Omit<NonNullable<BridgeConfig['ssh']>, 'privateKeyPath' | 'privateKeyPassphrase' | 'password' | 'agentPath'>> & {
     privateKeyPath?: string;
     privateKeyPassphrase?: string;
@@ -124,14 +139,15 @@ export interface ResolvedBridgeConfig extends BridgeConfig {
   };
   forward: { bindAddress: string; port: number };
   reconnect: { enabled: boolean; minDelayMs: number; maxDelayMs: number; factor: number };
-  pairing: { phonePort: number; qr: boolean };
+  pairing: { phonePort: number; qr: boolean; localPort: number; localHost: string };
   statusPage: boolean;
+  files: { enabled: boolean; root: string };
 }
 
 /** Transport snapshot returned by `status()`. */
 export interface BridgeStatus {
   /** Which transport produced this snapshot. */
-  mode: 'ssh' | 'relay';
+  mode: 'ssh' | 'relay' | 'tailscale';
   state: BridgeState;
   enabled: boolean;
   attempt: number;
@@ -139,8 +155,9 @@ export interface BridgeStatus {
   forwardedAt: number | null;
   uptimeMs: number;
   lastError: string | null;
-  authMethod: string | null;
-  ssh: { host: string; port: number; username: string };
+  authMethod?: string | null;
+  ssh?: { host: string; port: number; username: string };
+  tailscale?: { publicUrl: string; localPort: number };
   forward: {
     bindAddress: string;
     remotePort: number;
@@ -152,7 +169,7 @@ export interface BridgeStatus {
 /** Phone-side instructions for the live forward. */
 export interface PairingMaterial {
   /** Which transport these instructions are for. */
-  mode: 'ssh' | 'relay';
+  mode: 'ssh' | 'relay' | 'tailscale';
   /** Clean URL the phone opens. */
   url: string;
   /** One-time URL carrying the pairing secrets, when they are known. */
@@ -173,7 +190,7 @@ export interface SshBridgeService {
   pairing(): Promise<PairingMaterial | undefined>;
   restart(): void;
   stop(): void;
-  tunnel: unknown;
+  transport: unknown;
 }
 
 /** Stable Cordis plugin name. */

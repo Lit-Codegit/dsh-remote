@@ -1,7 +1,39 @@
 # dsh-remote
 
 用手机控制**任意一台**跑着 [DeepSeek Harness](https://github.com/deepseek-ai/deepseek-harness) 的机器。
-DSH 侧永远不开入站端口，不做 NAT 穿透、不打洞——两端都主动连出，在你自己的一台服务器上会合。
+可通过 Tailscale 私网直接访问，无须另外部署中继服务器；也保留自建 relay 和 SSH 转发方式。
+
+## Tailscale
+
+电脑和手机登录同一 Tailscale 网络，在 DSH 中启用本插件：
+
+```yaml
+- insert:
+    - id: ssh-bridge
+      name: dsh-ssh-bridge
+      config:
+        enabled: true
+        transport: tailscale
+        tailscale:
+          publicUrl: https://computer.example.ts.net
+          localPort: 9301
+- id: connection
+  config:
+    trustedHosts: !!js "[...(ctx.webStartup?.trustedHosts ?? []), 'computer.example.ts.net']"
+```
+
+将域名换成 `tailscale status --json` 中本机的 `Self.DNSName`（去掉末尾的点），然后执行：
+
+```bash
+tailscale serve --bg --https=443 http://127.0.0.1:9301
+```
+
+电脑打开 **http://127.0.0.1:9300/**，手机开启 Tailscale 后扫描配对二维码。配对后可收藏上面的 HTTPS 地址。
+DSH 重启时入口不变；需要重新登录时，到本机配对页取当前链接。
+
+`9300` 是仅供本机使用的配对页，`9301` 是仅监听 loopback 的反代端口。
+Serve 在 tailnet 内提供 HTTPS，不使用 Funnel。Tailscale 仍可能按网络条件使用 DERP；这里省去的是本项目的中继服务器。
+Serve 首次配置可能要求启用 tailnet 的 HTTPS；完整配置见 [bridge 文档](dsh-ssh-bridge/README.md#tailscale)。
 
 ![手机上的 DSH](docs/mobile.png)
 
@@ -9,7 +41,7 @@ DSH 侧永远不开入站端口，不做 NAT 穿透、不打洞——两端都�
 
 | 部分 | 说明 |
 |---|---|
-| [`dsh-ssh-bridge/`](dsh-ssh-bridge/) | DSH 插件 + 中继服务端。两种传输：`relay`（HTTPS 单端口）和 `ssh`（remote forward） |
+| [`dsh-ssh-bridge/`](dsh-ssh-bridge/) | DSH 插件：`tailscale` 私网入口、`relay` 中继和 `ssh` remote forward |
 | [`android-app/`](android-app/) | Android WebView 壳。只内置中继地址和访问密钥，token 每次启动现取 |
 | [`skills/`](skills/) | 两个给 agent 用的 skill：`dsh-remote` 装手机访问，`multi-agent-fleet` 管多机多 agent |
 | [`tools/`](tools/) | 验证脚本：走一遍真实重定向链路、抓浏览器控制台、渲染图标预览 |
@@ -133,8 +165,8 @@ skill 只在被加载时才占上下文，平时只是一个名字和一句话�
 
 ## 已验证
 
-- **46 个测试**：主机密钥校验、两种传输的端到端、配对链接、认证拒绝、证书指纹固定、重连、
-  连接池排空时的排队与恢复。
+- **84 个测试**：主机密钥校验、两种传输的端到端、配对链接、认证拒绝、证书指纹固定、重连、
+  连接池排空时的排队与恢复，以及 Tailscale HTTP/WebSocket、本机配对与文件边界。
 - **真实 Chromium**（390×844 手机视口）经公网中继加载：`#root` 挂载 34,766 字节，无未捕获异常，
   无失败请求。
 - **真机**：Android 10+ 经中继连入，界面可用。
