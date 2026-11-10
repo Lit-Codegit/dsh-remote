@@ -130,6 +130,9 @@ Check the changed-file scope, behavior, edge cases, and unrelated edits.
 Require command, cwd, exit code, and meaningful output for each claimed validation result.
 Run the checks needed to verify the change; record failures, skipped checks, and limitations.
 Required tests and CI remain acceptance conditions. A timeout or empty test selection is not a pass.
+Keep validation within the assigned repository and recorded run artifacts. If runtime
+configuration integrity is relevant, prefer metadata or a pre-recorded hash; report missing
+evidence rather than dumping global configuration or attempting an unrequested restoration.
 
 Return concrete findings to the worker when changes are needed, using a supported follow-up
 or a new attempt. Keep implementation and independent acceptance decisions distinguishable.
