@@ -44,7 +44,7 @@ Serve 首次配置可能要求启用 tailnet 的 HTTPS；完整配置见 [bridge
 | [`dsh-ssh-bridge/`](dsh-ssh-bridge/) | DSH 插件：`tailscale` 私网入口、`relay` 中继和 `ssh` remote forward |
 | [`android-app/`](android-app/) | Android WebView 壳。只内置中继地址和访问密钥，token 每次启动现取 |
 | [`skills/`](skills/) | 两个给 agent 用的 skill：`dsh-remote` 装手机访问，`multi-agent-fleet` 协调本机或多机 coding agent |
-| [`tools/`](tools/) | 验证脚本：走一遍真实重定向链路、抓浏览器控制台、渲染图标预览 |
+| [`tools/`](tools/) | Agent 启动与历史接入、链路验证、浏览器检查和图标预览 |
 
 ## 两个 skill
 
@@ -58,6 +58,9 @@ Serve 首次配置可能要求启用 tailnet 的 HTTPS；完整配置见 [bridge
 `multi-agent-fleet` 让 DSH 负责协调，由已安装的 Codex、OpenCode 等 CLI 执行任务。
 本机即可使用；独立任务分别记录任务文件、进程和结果，写入任务使用独立 worktree。
 沿用每个 agent 已有的模型、认证和权限设置，完成后由 DSH 检查改动与验证证据。
+Codex 任务默认通过 [`codex-worker.mjs`](tools/codex-worker.mjs) 接入原生界面的「置顶」，
+保留原会话 ID 和记录；只有用户明确要求时才用 `--skip-history` 跳过。
+接入失败会记录在 `history.json` 并返回失败状态，方便重试。
 
 ## 三种用法
 

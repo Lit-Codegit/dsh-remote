@@ -8,6 +8,11 @@ description: Coordinate coding CLI workers from DSH on the local machine. Use wh
 DSH coordinates the work; installed CLI processes do the assigned tasks.
 Start locally. One machine is enough. Remote access to DSH does not authorize remote workers.
 
+Codex workers must appear in the user's native Codex GUI history by default. Skip GUI
+registration only when the user explicitly opts out for that task; background execution
+is not an opt-out. Keep the original thread ID and transcript, and use the official section
+metadata APIs rather than editing Codex databases or changing a thread's source.
+
 ## 1. Establish the run
 
 Read the repository instructions, working-tree status, and the user's requested outcome.
@@ -78,6 +83,16 @@ Invoke the verified absolute executable from the task's recorded working directo
 Use the CLI's documented file or standard-input mechanism for the task text.
 Keep prompts and paths as arguments or file contents; apply proper shell quoting when needed.
 
+For Codex, use the repository's `tools/codex-worker.mjs` launcher described in the
+[local reference](references/local-agents.md). It registers `thread.started` in the native
+Pinned section and saves `history.json`, retaining the original history and live thread.
+If the user has already organized that thread into another section, preserve that placement.
+Only pass `--skip-history` after an explicit user opt-out. Normal local transcript persistence
+remains enabled; an opt-out from GUI registration does not request deleting local history.
+If an older launcher must be used, run `tools/codex-history.mjs` for its exact emitted ID.
+Retry a pending registration after worker exit. Report unavailable registration rather than
+silently leaving an otherwise required conversation hidden.
+
 Save these artifacts for each attempt:
 
 | Artifact | Contents |
@@ -88,6 +103,7 @@ Save these artifacts for each attempt:
 | `exit.json` | Exit code or termination signal and end time, written by the launcher |
 | `result.md` | Worker final response saved by the launcher, with changes, checks, and blockers |
 | `review.md` | Independent review and acceptance decision |
+| `history.json` | Native thread ID, GUI registration result and open link, or explicit opt-out |
 
 Have the worker return its result through the CLI output. The launcher or coordinator saves
 `result.md` in the run directory; the worker need not write outside its authorized checkout.
@@ -98,6 +114,8 @@ Use restrictive file access for logs that may contain project data; redact secre
 
 Complete this step when a launch has a recorded process identity and durable output paths.
 If launch fails, record the failure; do not mark the task as running.
+GUI registration is complete only when the native section query returns that same worker
+ID. A rollout file or a deep link alone does not establish inclusion in the GUI list.
 
 ## 4. Track and recover
 
@@ -145,6 +163,7 @@ Complete this step when `review.md` records acceptance with evidence, or specifi
 ## 6. Close the run
 
 Report accepted work, validation, remaining blockers, and where the branches and evidence live.
+Include the Codex GUI title/open link and registration state, or the user's explicit opt-out.
 Confirm that each launched attempt has an exit record or is deliberately still running.
 Retain unfinished or unreviewed worktrees and their logs so another turn can continue safely.
 Remove a completed worktree only after its work is preserved, its status is clean, and removal

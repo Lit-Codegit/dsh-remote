@@ -25,8 +25,9 @@ installed vendor-bundled CLI may support the existing configuration; retain the 
 default model unless a per-run change is authorized. A successful turn, not a cached model
 name or the version string, establishes that the chosen combination works.
 
-The examples below were checked against Codex CLI 0.150.1 and OpenCode 1.19.3. They start a
-real agent and may use the configured provider; `--help`/`--version` alone are discovery.
+The direct CLI examples below were checked against Codex CLI 0.150.1 and OpenCode 1.19.3;
+native section integration was checked with Codex CLI 0.166.0-alpha.6. They start a real
+agent and may use the configured provider; `--help`/`--version` alone are discovery.
 Choose the worker checkout and absolute run directory before using an example.
 
 Codex also writes runtime state under its original configuration directory. A DSH sandbox
@@ -53,6 +54,48 @@ permission change. If approval is unavailable, report the block instead of copyi
 authentication, disabling the child's sandbox, or trying alternative tools to escape it.
 
 ## Codex
+
+### Default native history integration
+
+The user requires GUI history integration by default. Resolve this skill directory's real
+path to locate the checkout and use its launcher:
+
+```bash
+node "$repo_root/tools/codex-worker.mjs" \
+  --cwd "$worker_cwd" --task "$task_file" --run-dir "$run_dir" \
+  --codex-bin "$codex_bin"
+```
+
+Create the task file outside a fresh run directory. For an explicitly authorized coding
+task, add `--sandbox workspace-write`; otherwise retain the CLI's configured permissions.
+The launcher keeps the original configuration directory, model and authentication. It saves
+the PID, events, result and exit status, and registers the original thread through the
+official section APIs. No additional model turn is used for registration.
+
+The normal Codex list filters out `exec` workers. The native section query includes them,
+so new workers are placed in the built-in Pinned section with a concise `DSH · <task>` title.
+Existing user section placement is retained. This changes organization metadata, not the
+thread source, ID, history or project files. A GUI refresh may be needed to update its cache.
+
+Only when the user explicitly asks to keep a task out of the GUI, add `--skip-history`.
+This skips native registration; it does not delete the CLI's ordinary local transcript.
+An unavailable section API is a pending integration failure, not permission to edit the
+database or pretend the GUI entry exists.
+
+To register a worker produced by another launcher, or retry a pending entry:
+
+```bash
+node "$repo_root/tools/codex-history.mjs" \
+  --thread-id "$thread_id" --codex-bin "$codex_bin" \
+  --title "DSH · $task_title" --output "$run_dir/history.json"
+```
+
+The helper verifies persistence using the same section/source filters as the GUI. Keep its
+returned ID and `codex://threads/<id>` link with the run. The explicit `--skip-history` helper
+option performs no Codex RPC operations. Metadata APIs do not provide visual inspection
+of the desktop UI; distinguish verified list inclusion from a user-confirmed rendered entry.
+
+### Direct CLI interface
 
 `exec` accepts `-` for a prompt on standard input, `--json` for structured stdout,
 `--output-last-message` (`-o`) for its final response, and `--cd` (`-C`) for cwd.
