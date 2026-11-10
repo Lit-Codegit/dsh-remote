@@ -22,9 +22,16 @@ verify its examples against the installed binary before using them.
 
 Use the user's existing model, authentication, sandbox, and approval configuration.
 Record configuration names or paths when useful, without copying credentials into task files.
+Keep the worker's original configuration directory. Do not copy or symlink authentication
+files into temporary run directories to work around a sandbox failure. Ask for the specific
+runtime-directory access the CLI needs, or report the block. A task may explicitly authorize
+a bounded per-run workspace-write mode; that does not authorize broader or global changes.
 If a CLI is missing or needs login, report that requirement and continue independent work.
 When approval blocks a worker, report the exact action and approval route to the user.
 Keep its current permissions; unattended execution is not a reason to widen them.
+If the provider rejects the configured model, preserve the error and use a different model
+only within the user's authorization. Metadata or a local model cache alone is not proof
+that the account can run it. Avoid repeated preflight attempts with the same rejected setup.
 
 Complete this step when the run has a repository, base commit, available worker,
 verified invocation interface, permission boundary, and checkable outcome.

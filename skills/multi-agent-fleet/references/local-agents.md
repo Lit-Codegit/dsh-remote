@@ -18,9 +18,39 @@ directory, and record the verified absolute executable. Use it in each launcher;
 CLIs may also need their Node directory added to that command's PATH. Do not change global
 shell configuration or treat a missing executable as a reason to reinstall a working CLI.
 
+When more than one official installation exists, record which one was selected. A CLI found
+first on PATH may be older than the configured model. If its provider rejects that model,
+compare the installed versions and account model catalogs before retrying. An already
+installed vendor-bundled CLI may support the existing configuration; retain the user's
+default model unless a per-run change is authorized. A successful turn, not a cached model
+name or the version string, establishes that the chosen combination works.
+
 The examples below were checked against Codex CLI 0.150.1 and OpenCode 1.19.3. They start a
 real agent and may use the configured provider; `--help`/`--version` alone are discovery.
 Choose the worker checkout and absolute run directory before using an example.
+
+Codex also writes runtime state under its original configuration directory. A DSH sandbox
+must permit those normal runtime writes as well as the project. If initialization is denied,
+request access to the exact runtime directory or report the block; keep `CODEX_HOME` intact
+and keep authentication files out of temporary directories. For an authorized coding task,
+an explicitly approved per-run `--sandbox workspace-write` can enable project writes; it
+does not grant a broader DSH sandbox or change the user's persistent configuration.
+
+### macOS nested sandboxes
+
+If Codex reports `sandbox_apply: Operation not permitted` for every command or file tool
+when launched inside DSH, the outer macOS sandbox can prevent Codex from establishing its
+own sandbox. Changing the project directory or model will not resolve this condition.
+Stop the failed attempt and preserve its evidence; an exit code of zero can still accompany
+a final response that says no work was possible.
+
+DSH's `bash` tool supports a reviewed, single-call escalation using
+`sandbox_permissions: "danger-full-access"` and a `justification`. This applies only to the
+outer launch and requires approval. Keep the child command's `--sandbox workspace-write`,
+fixed binary, cwd and task paths; review any launcher script before approving it once.
+This is not authorization for arbitrary unsandboxed shell commands or a session/global
+permission change. If approval is unavailable, report the block instead of copying
+authentication, disabling the child's sandbox, or trying alternative tools to escape it.
 
 ## Codex
 
