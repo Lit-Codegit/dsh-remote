@@ -1,118 +1,78 @@
 ---
 name: dsh-remote
-description: Install and configure dsh-remote so a user can reach their DeepSeek Harness from a phone — an outbound-only relay or SSH tunnel plus an optional Android app. Use when the user wants remote/mobile access to their DSH, or needs an existing dsh-remote deployment diagnosed.
+description: Configure or diagnose phone access to DSH through private Tailscale Serve, a self-hosted relay, or SSH forwarding. Use when the user wants to connect a phone, repair pairing, or restore a remote DSH connection.
 ---
 
-# dsh-remote
+# DSH remote access
 
-Gives a user access to one DSH instance from a phone without exposing any inbound port on the
-DSH host. The host dials out; the phone dials in; they meet at a server the user controls.
+Inspect the existing DSH profile and running services before changing them. Preserve a
+working deployment and its address. Resolve this skill directory's symlink to locate the
+checkout; read its root `README.md` and `dsh-ssh-bridge/README.md` for configuration.
 
-Two transports, same plugin:
+## Choose the connection
 
-- **relay** (recommended for phones) — the plugin keeps idle TLS connections to a relay on a
-  public server; the phone opens one HTTPS URL in a browser. No app, no SSH client.
-- **ssh** — the plugin opens a remote forward on an existing sshd; the phone uses any SSH
-  client with `-L`. Nothing to install on the server.
+| Mode | Requirements | Phone |
+| --- | --- | --- |
+| `tailscale` | Both devices on the same tailnet; system Tailscale + Serve | Browser |
+| `relay` | A separately deployed dsh relay server | Browser or configured Android shell |
+| `ssh` | An SSH server and forwarding on both ends | SSH client + browser |
 
-Before starting, establish which transport the user wants and whether they already have a
-server with a public IP. Both layouts are in `README.md`; read it before improvising.
+Use an existing configured mode. For a new setup, prefer Tailscale when the user wants no
+separate relay server and can connect both devices to the same tailnet. Tailscale may use
+DERP; this mode removes the dsh relay requirement, not every possible relay path.
 
-## Step 1 — install the plugin into a profile
+## Tailscale
 
-The profile's `cordis.patch.yml` is the only place to edit.
+1. Read `tailscale status --json` and `tailscale serve status --json`. Obtain the current
+   device's DNS name without printing account or peer inventories. Preserve unrelated Serve
+   handlers; use another HTTPS port if the intended port is already occupied.
+2. Load the bridge in the intended DSH profile using `transport: tailscale`, the current
+   `tailscale.publicUrl`, and a stable `tailscale.localPort` (default `9301`). Keep the
+   pairing listener on loopback (default `127.0.0.1:9300`). Add only the exact external
+   authority to DSH `connection.trustedHosts`, retaining existing entries.
+3. Point private Serve at the bridge's stable loopback port:
 
-```yaml
-- insert:
-    - id: ssh-bridge
-      name: dsh-ssh-bridge
-      config:
-        transport: relay
-        relay:
-          host: relay.example.com
-          port: 8443
-          publicHost: relay.example.com
-          token: 'REPLACE_WITH_YOUR_HOST_TOKEN'
-          accessToken: 'REPLACE_WITH_YOUR_ACCESS_KEY'
-          fingerprint: 'REPLACE_WITH_RELAY_CERT_SHA256'
-          poolSize: 32
-          refreshMs: 300
-```
+   ```bash
+   tailscale serve --bg --https=443 http://127.0.0.1:9301
+   ```
 
-The package must be resolvable from the profile. For a checkout, a directory junction into
-`<profile>/node_modules/dsh-ssh-bridge` is enough on Windows; `pnpm add file:<path>` works too.
-Editing the patch file reloads the plugin without restarting DSH.
+   Adapt the HTTPS port and URL to the reviewed configuration. Use Serve, not public
+   Funnel. The bridge follows DSH's changing listener; do not publish the pairing page.
+4. Send the owner to `http://127.0.0.1:9300/` on the DSH host. The phone connects to
+   Tailscale and scans the current QR code. Bookmark the clean HTTPS address after login.
+   DSH restart can invalidate the login token; retrieve a fresh link from the local page.
 
-**Relay mode also needs the phone's authority trusted**, because it is no longer loopback:
+The mode needs no `relay.token` or `relay.accessToken`. File routes default to disabled;
+enable them only for an explicitly requested directory. The Android shell currently uses
+relay-specific build configuration; use a phone browser for Tailscale.
 
-```yaml
-- id: connection
-  config:
-    trustedHosts: !!js "[...(ctx.webStartup?.trustedHosts ?? []), 'relay.example.com:8443']"
-```
+## Relay or SSH
 
-The `!!js` value must be a **quoted string**, or the YAML parser treats it as a flow sequence.
-Skipping this yields a page shell whose every `/api` call is `403` — it looks like a blank app.
+Follow the matching bridge README section for the installed version. A local checkout may
+be loaded by its absolute `lib/index.mjs` path after installing its locked dependencies.
+Back up the profile before editing; preserve its other plugin settings.
 
-## Step 2 — run the relay (relay mode only)
+For relay, configure host/access credentials and certificate verification, ensure a
+sufficient idle connection pool, and allow the exact external authority in `trustedHosts`.
+For SSH, retain host-key verification and check the phone's local forwarding destination.
+Neither deployment procedure authorizes changing existing SSH credentials or firewall
+rules outside the requested service.
 
-Needs Node 22 on the server. No npm dependencies: certificate generation falls back to
-`openssl` when the optional `selfsigned` package is absent.
+## Verify the actual path
 
-```bash
-scp -r dsh-ssh-bridge user@server:/opt/
-cd /opt/dsh-ssh-bridge && node bin/dsh-relay.mjs --port 8443 --host <public-address> --pool 64
-```
+- Confirm the local pairing page has current material; `forwarding` in Tailscale mode
+  means the local proxy is ready, not that the phone is reachable.
+- Validate HTTPS with normal certificate checks. First-time token exchange must redirect
+  to a clean URL, set the DSH session cookie, and allow the actual GUI to load.
+- Verify `/api/remote.mux` establishes a WebSocket and receives frames. HTML 200 alone is
+  insufficient. Check unauthenticated requests remain rejected.
+- On Tailscale/Clash conflicts, compare system DNS, Quad100 (`100.100.100.100`), and the
+  correct tailnet IP. A fake-IP answer identifies a DNS path issue. Keep tailnet DNS and
+  traffic on Tailscale using narrow persistent rules; preserve unrelated proxy settings.
+- In relay mode, inspect relay health, certificate trust, host availability and pool
+  capacity before changing the frontend. Existing probe scripts may print credentials
+  or disable certificate checks; inspect them before use and treat that output accordingly.
 
-It prints the host token, access key, certificate fingerprint, and a ready-to-paste plugin
-config. Keep those three values; only the certificate changes if it is regenerated.
-
-Open the port in the cloud firewall **and** the host firewall. Run it under systemd with
-`Restart=always` so a dropped connection is not permanent.
-
-## Step 3 — pair the phone
-
-Tell the user to open `http://127.0.0.1:<dshPort>/ssh-bridge?rk=<accessToken>` on the desktop
-or read the QR from it. That page always renders the *current* pairing link.
-
-The launch token rotates on every DSH restart, so never hand a user a stored link; send them
-to that page. The fixed local pairing page (`pairing.localPort`, default 9300) is bookmarkable
-and survives restarts — prefer it when the user will pair more than once.
-
-## Step 4 — the Android app (optional)
-
-`android-app/` builds a WebView shell that holds only the relay URL and access key, and fetches
-the rotating token itself on each launch:
-
-```
-/ssh-bridge?rk=<key>&go=1  -> 302 to the current pairing link -> both cookies -> DSH UI
-```
-
-`go=1` makes the plugin answer with a redirect instead of the status page. The app trusts the
-relay certificate as a bundled anchor (`res/raw/relay_cert.pem`); the committed one is a sample.
-
-## Diagnosing a blank screen
-
-Work outside-in before changing app code:
-
-1. `curl -sk https://<relay>/__relay/health` — `idle` must exceed the browser's per-host
-   connection count (it opens 6–12 at once). A small `poolSize` makes the relay answer `503`
-   for some assets; the HTML still renders 200, so there is no error page — just white.
-2. `node tools/check-app-flow.mjs <relayBase> <accessKey>` — walks the redirect chain and
-   prints each hop plus the cookies collected. Both `dsh_relay` and `dsh-auth-*` must appear.
-3. `node tools/check-assets.mjs <relayBase> <accessKey>` — fetches every asset the index
-   references and attempts the `/api/remote.mux` upgrade.
-4. `node tools/probe-browser.mjs <pairingLink>` — loads the page in real Chromium and reports
-   `#root` child count, uncaught errors, and failed requests. `#root` empty with no failed
-   requests points at a script that never ran.
-
-## Rules
-
-- Never write a real access token, host token, certificate fingerprint, keystore, or built APK
-  into a repository. An APK contains the access key; publishing it hands out access.
-- `poolSize` must exceed the browser's concurrent connection count; keep it at 32 or above and
-  the relay's `--pool` at 64.
-- Rotating the relay certificate requires replacing `res/raw/relay_cert.pem`, the pinned
-  fingerprint in both the plugin and the app, and rebuilding the app.
-- Revoking access means changing `ACCESS_TOKEN` in the relay's `secrets.env` and restarting it;
-  existing phone cookies stop working.
+Keep launch tokens, pairing URLs, cookies, access keys and private keys out of logs and git.
+Report the clean access URL, the local pairing page, what was tested, and any device-side
+step still required. Installing this skill alone does not deploy a new service.

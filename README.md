@@ -43,7 +43,7 @@ Serve 首次配置可能要求启用 tailnet 的 HTTPS；完整配置见 [bridge
 |---|---|
 | [`dsh-ssh-bridge/`](dsh-ssh-bridge/) | DSH 插件：`tailscale` 私网入口、`relay` 中继和 `ssh` remote forward |
 | [`android-app/`](android-app/) | Android WebView 壳。只内置中继地址和访问密钥，token 每次启动现取 |
-| [`skills/`](skills/) | 两个给 agent 用的 skill：`dsh-remote` 装手机访问，`multi-agent-fleet` 管多机多 agent |
+| [`skills/`](skills/) | 两个给 agent 用的 skill：`dsh-remote` 装手机访问，`multi-agent-fleet` 协调本机或多机 coding agent |
 | [`tools/`](tools/) | 验证脚本：走一遍真实重定向链路、抓浏览器控制台、渲染图标预览 |
 
 ## 两个 skill
@@ -52,16 +52,16 @@ Serve 首次配置可能要求启用 tailnet 的 HTTPS；完整配置见 [bridge
 
 | skill | 什么时候用 |
 |---|---|
-| [`dsh-remote`](skills/dsh-remote/SKILL.md) | 「帮我把手机访问配好」——装插件、起中继、配对、排障 |
-| [`multi-agent-fleet`](skills/multi-agent-fleet/SKILL.md) | 「这几台机器上的 agent 你来管」——多机并行派活、资源护栏、质量门禁、定时巡检 |
+| [`dsh-remote`](skills/dsh-remote/SKILL.md) | 「帮我把手机访问配好」——Tailscale / relay / SSH、配对、排障 |
+| [`multi-agent-fleet`](skills/multi-agent-fleet/SKILL.md) | 「协调本机 Codex、OpenCode」——拆任务、隔离工作区、跟踪结果、复核验收 |
 
-`multi-agent-fleet` 提炼自一次约 28 小时的真实作业：一台 DSH 当协调者，把 coding agent 派到
-5 台机器上并行修 39 个 issue，期间踩过的坑（全局 `pgrep` 卡死 18 小时、默认 codegen units 导致
-OOM、`tmux kill-session` 不杀子进程、PR 开到了 fork 上）都写在里面了。
+`multi-agent-fleet` 让 DSH 负责协调，由已安装的 Codex、OpenCode 等 CLI 执行任务。
+本机即可使用；独立任务分别记录任务文件、进程和结果，写入任务使用独立 worktree。
+沿用每个 agent 已有的模型、认证和权限设置，完成后由 DSH 检查改动与验证证据。
 
 ## 三种用法
 
-**只想在电脑上用** —— 不需要这个项目。
+**只在电脑上使用 DSH 界面** —— 不需要远程连接插件；本仓库的协调 skill 可以单独安装。
 
 **手机浏览器访问（推荐）** —— 部署中继，手机开一个网址：
 
@@ -129,8 +129,8 @@ node bin/dsh-relay.mjs --port 8443 --host <你的公网地址> --pool 64
 ```
 
 ```bash
-ln -s "$PWD/skills/dsh-remote"         ~/.dsh/skills/dsh-remote
-ln -s "$PWD/skills/multi-agent-fleet"  ~/.dsh/skills/multi-agent-fleet
+bash tools/install-skills.sh      # macOS / Linux；支持 DSH_HOME
+# 移除本仓库创建的链接：bash tools/install-skills.sh --remove
 ```
 
 用 junction/软链的好处是：仓库里改了 skill，DSH 直接看到新内容。
@@ -150,7 +150,7 @@ ln -s "$PWD/skills/multi-agent-fleet"  ~/.dsh/skills/multi-agent-fleet
 装好之后：
 
 - 「帮我把手机访问配好」→ agent 按 `dsh-remote` 走
-- 「这几台服务器上的 agent 你来调度」→ agent 按 `multi-agent-fleet` 走
+- 「你做协调者，让本机 Codex 实现、OpenCode 复核」→ DSH 按 `multi-agent-fleet` 拆分和派发
 
 skill 只在被加载时才占上下文，平时只是一个名字和一句话描述。
 
