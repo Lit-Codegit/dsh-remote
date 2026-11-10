@@ -10,8 +10,9 @@ Start locally. One machine is enough. Remote access to DSH does not authorize re
 
 Codex workers must appear in the user's native Codex GUI history by default. Skip GUI
 registration only when the user explicitly opts out for that task; background execution
-is not an opt-out. Keep the original thread ID and transcript, and use the official section
-metadata APIs rather than editing Codex databases or changing a thread's source.
+is not an opt-out. Create the native identity through official `thread/start`, then execute
+the task with `exec resume` in that same ID. Preserve the transcript and source; do not edit
+Codex databases to make a background worker look interactive.
 
 ## 1. Establish the run
 
@@ -84,12 +85,15 @@ Use the CLI's documented file or standard-input mechanism for the task text.
 Keep prompts and paths as arguments or file contents; apply proper shell quoting when needed.
 
 For Codex, use the repository's `tools/codex-worker.mjs` launcher described in the
-[local reference](references/local-agents.md). It registers `thread.started` in the native
-Pinned section and saves `history.json`, retaining the original history and live thread.
-If the user has already organized that thread into another section, preserve that placement.
+[local reference](references/local-agents.md). It creates and persists a native conversation,
+then resumes that exact ID for the task. It saves `history.json` only as integrated once the
+ordinary native history query returns that worker. Preserve any user section placement.
 Only pass `--skip-history` after an explicit user opt-out. Normal local transcript persistence
 remains enabled; an opt-out from GUI registration does not request deleting local history.
-If an older launcher must be used, run `tools/codex-history.mjs` for its exact emitted ID.
+If an older launcher produces a native `cli`/`vscode` thread, run `tools/codex-history.mjs`
+for its exact emitted ID. A legacy `exec` thread needs an official fork import with a new ID;
+retain the original, report both IDs, and distinguish any added confirmation turn. Do not
+silently treat an imported copy as the original worker.
 Retry a pending registration after worker exit. Report unavailable registration rather than
 silently leaving an otherwise required conversation hidden.
 
@@ -114,8 +118,9 @@ Use restrictive file access for logs that may contain project data; redact secre
 
 Complete this step when a launch has a recorded process identity and durable output paths.
 If launch fails, record the failure; do not mark the task as running.
-GUI registration is complete only when the native section query returns that same worker
-ID. A rollout file or a deep link alone does not establish inclusion in the GUI list.
+GUI registration is complete only when the ordinary native query (`sourceKinds: []`, no
+section filter) returns that same worker ID. It also needs a non-empty preview from a real
+user turn. A rollout file, deep link, or all-sources Pinned query does not establish this.
 
 ## 4. Track and recover
 

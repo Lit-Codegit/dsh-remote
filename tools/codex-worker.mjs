@@ -2,7 +2,7 @@
 
 import { spawn } from 'node:child_process';
 import { constants } from 'node:fs';
-import { access, chmod, lstat, mkdir, open, readFile, readdir, rename, stat, writeFile } from 'node:fs/promises';
+import { access, chmod, lstat, mkdir, open, readFile, readdir, realpath, rename, stat, writeFile } from 'node:fs/promises';
 import os from 'node:os';
 import path from 'node:path';
 import readline from 'node:readline';
@@ -10,7 +10,7 @@ import { finished } from 'node:stream/promises';
 import { pathToFileURL } from 'node:url';
 import { randomUUID } from 'node:crypto';
 
-import { CodexRpcClient, registerCodexHistory } from './codex-history.mjs';
+import { CodexRpcClient, createNativeCodexThread, registerCodexHistory } from './codex-history.mjs';
 
 const BUNDLED_CODEX = '/Applications/ChatGPT.app/Contents/Resources/codex-cli/CodexCLI.app/Contents/MacOS/codex';
 const UUID = /^[0-9a-f]{8}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{4}-[0-9a-f]{12}$/i;
@@ -56,6 +56,7 @@ function signalExitCode(signal) {
 export async function runCodexWorker(options, {
   spawnFn = spawn,
   createRpc = (binary) => new CodexRpcClient(binary, { timeoutMs: 5000 }),
+  createNativeThread = createNativeCodexThread,
   registerHistory = registerCodexHistory,
   env = process.env,
   signalSource = process,
@@ -122,6 +123,8 @@ export async function runCodexWorker(options, {
   let registrations = 0;
   let evidenceError;
   let spawnError;
+  let bootstrapError;
+  let workerThreadSeen = false;
   const observeWrite = (promise) => { promise.catch((error) => { evidenceError ??= error; }); };
   const interrupt = (signal) => {
     interruptedSignal ??= signal;
@@ -184,10 +187,41 @@ export async function runCodexWorker(options, {
     }
   }
 
+  async function bootstrap() {
+    let rpc;
+    try {
+      rpc = createRpc(binary);
+      activeRpc = rpc;
+      await rpc.initialize();
+      const native = await createNativeThread({
+        rpc, cwd: options.cwd, title,
+        ...(options.sandbox ? { sandbox: options.sandbox } : {}),
+      });
+      if (!UUID.test(native?.threadId ?? '') || !['cli', 'vscode'].includes(native.source)) {
+        throw new Error('Native bootstrap did not return an interactive Codex thread');
+      }
+      if (typeof native.cwd !== 'string' || !path.isAbsolute(native.cwd)
+        || await realpath(native.cwd) !== await realpath(options.cwd)) {
+        throw new Error('Native bootstrap returned a different working directory');
+      }
+      run.threadId = native.threadId;
+      run.nativeThread = native;
+      history = { integrated: false, state: 'pending', threadId: native.threadId, source: native.source, attempts: 0 };
+      await save('run.json', run);
+    } catch (error) {
+      bootstrapError = error;
+      history = { integrated: false, state: 'pending', stage: 'bootstrap', threadId: run.threadId, attempts: 0, error: error.message };
+    } finally {
+      try { await closeRpc(rpc); } catch (error) { history.cleanupError = error.message; }
+      if (activeRpc === rpc) activeRpc = undefined;
+      await save('history.json', history);
+    }
+  }
+
   let events;
   let stderr;
   let lines;
-  let workerCode = 1;
+  let workerCode = null;
   let workerSignal = null;
   try {
     // Open log files before spawning; stdout is never copied to the wrapper console.
@@ -205,47 +239,66 @@ export async function runCodexWorker(options, {
     };
     events.on('error', stopOnLogError);
     stderr.on('error', stopOnLogError);
-    const args = ['exec', '-C', options.cwd, '--json', '-o', file('result.md')];
+    if (!options.skipHistory) await bootstrap();
+    const args = options.skipHistory
+      ? ['exec', '-C', options.cwd, '--json', '-o', file('result.md')]
+      : ['exec', '--json', '-o', file('result.md')];
     if (options.sandbox) args.push('--sandbox', options.sandbox);
+    if (!options.skipHistory) args.push('resume', run.threadId);
     args.push('-');
     try {
-      child = spawnFn(binary, args, { cwd: options.cwd, env, stdio: ['pipe', 'pipe', 'pipe'] });
-      run.pid = child.pid ?? null;
-      run.state = 'running';
-      observeWrite(save('run.json', run));
-      const exited = new Promise((resolve) => {
-        child.once('error', (error) => { spawnError = error; resolve({ code: 1, signal: null }); });
-        child.once('exit', (code, signal) => resolve({ code, signal }));
-      });
-      child.stdout.pipe(events);
-      child.stderr.pipe(stderr);
-      lines = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
-      lines.on('line', (line) => {
-        let event;
-        try { event = JSON.parse(line); } catch { return; }
-        if (event.type !== 'thread.started' || run.threadId) return;
-        const id = event.thread_id ?? event.threadId ?? event.thread?.id;
-        if (!UUID.test(id ?? '')) return;
-        run.threadId = id;
+      if (bootstrapError || interruptedSignal) {
+        events.end();
+        stderr.end();
+      } else {
+        child = spawnFn(binary, args, { cwd: options.cwd, env, stdio: ['pipe', 'pipe', 'pipe'] });
+        run.pid = child.pid ?? null;
+        run.state = 'running';
         observeWrite(save('run.json', run));
-        history.threadId = id;
-        observeWrite(save('history.json', history));
-        if (!options.skipHistory) {
-          registration = writes.get('run.json').then(() => register());
-          registration.catch((error) => { evidenceError ??= error; });
-        }
-      });
-      child.stdin.on('error', (error) => {
-        if (!['EPIPE', 'ERR_STREAM_DESTROYED'].includes(error.code)) evidenceError ??= error;
-      });
-      child.stdin.end(task);
-      if (interruptedSignal) interrupt(interruptedSignal);
-      const outcome = await exited;
-      workerSignal = outcome.signal;
-      workerCode = outcome.signal ? signalExitCode(outcome.signal)
-        : Number.isInteger(outcome.code) && outcome.code >= 0 ? outcome.code : 1;
+        const exited = new Promise((resolve) => {
+          child.once('error', (error) => { spawnError = error; resolve({ code: 1, signal: null }); });
+          child.once('exit', (code, signal) => resolve({ code, signal }));
+        });
+        child.stdout.pipe(events);
+        child.stderr.pipe(stderr);
+        lines = readline.createInterface({ input: child.stdout, crlfDelay: Infinity });
+        lines.on('line', (line) => {
+          let event;
+          try { event = JSON.parse(line); } catch { return; }
+          if (event.type !== 'thread.started') return;
+          const id = event.thread_id ?? event.threadId ?? event.thread?.id;
+          if (!UUID.test(id ?? '')) return;
+          if (!options.skipHistory && id !== run.threadId) {
+            evidenceError ??= new Error('Worker reported a different thread than its native bootstrap');
+            run.reportedThreadId = id;
+            observeWrite(save('run.json', run));
+            interrupt('SIGTERM');
+            return;
+          }
+          if (workerThreadSeen) return;
+          workerThreadSeen = true;
+          run.threadId = id;
+          observeWrite(save('run.json', run));
+          history.threadId = id;
+          observeWrite(save('history.json', history));
+          if (!options.skipHistory) {
+            registration = writes.get('run.json').then(() => register());
+            registration.catch((error) => { evidenceError ??= error; });
+          }
+        });
+        child.stdin.on('error', (error) => {
+          if (!['EPIPE', 'ERR_STREAM_DESTROYED'].includes(error.code)) evidenceError ??= error;
+        });
+        child.stdin.end(task);
+        if (interruptedSignal) interrupt(interruptedSignal);
+        const outcome = await exited;
+        workerSignal = outcome.signal;
+        workerCode = outcome.signal ? signalExitCode(outcome.signal)
+          : Number.isInteger(outcome.code) && outcome.code >= 0 ? outcome.code : 1;
+      }
     } catch (error) {
       spawnError = error;
+      workerCode = 1;
       events.end();
       stderr.end();
     } finally {
@@ -269,17 +322,21 @@ export async function runCodexWorker(options, {
       await Promise.all([eventHandle.close(), stderrHandle.close()]);
     }
     await registration.catch((error) => { evidenceError ??= error; });
-    if (!options.skipHistory && !history.integrated && run.threadId && !interruptedSignal) {
-      await register(); // One final attempt after exec has released its writer/metadata locks.
+    if (!options.skipHistory && !bootstrapError && workerThreadSeen && !interruptedSignal) {
+      await register(); // Revalidate completed history after exec releases its writer/metadata locks.
     }
-    if (!options.skipHistory && !run.threadId) {
-      history.error = 'No valid thread.started event was received; history registration is pending';
+    if (!options.skipHistory && !bootstrapError && !workerThreadSeen) {
+      history = {
+        ...history, integrated: false, state: 'pending', stage: 'worker-event',
+        error: 'No valid thread.started event was received; history registration is pending',
+      };
       await save('history.json', history);
     }
     await Promise.all([...writes.values()]);
-    const exitCode = workerCode !== 0 ? workerCode
+    const exitCode = workerCode !== null && workerCode !== 0 ? workerCode
       : interruptedSignal ? signalExitCode(interruptedSignal)
-        : evidenceError ? 1 : !options.skipHistory && !history.integrated ? HISTORY_FAILURE_EXIT_CODE : 0;
+        : bootstrapError ? HISTORY_FAILURE_EXIT_CODE
+          : evidenceError ? 1 : !options.skipHistory && (!history.integrated || !workerThreadSeen) ? HISTORY_FAILURE_EXIT_CODE : 0;
     const endedAt = new Date().toISOString();
     run.state = 'completed';
     run.endedAt = endedAt;
@@ -287,7 +344,7 @@ export async function runCodexWorker(options, {
     const result = {
       exitCode, workerExitCode: workerCode, workerSignal, interruptedSignal: interruptedSignal ?? null,
       pid: run.pid, startedAt, endedAt, runDir, threadId: run.threadId,
-      history, ...(spawnError ? { error: spawnError.message } : {}),
+      history, ...(bootstrapError ? { error: bootstrapError.message } : spawnError ? { error: spawnError.message } : {}),
       ...(evidenceError ? { evidenceError: evidenceError.message } : {}),
     };
     await save('exit.json', result);
@@ -324,6 +381,7 @@ async function main() {
     runDir: result.runDir, threadId: result.threadId, exitCode: result.exitCode,
     workerExitCode: result.workerExitCode, history: result.history.state,
     ...(result.history.deepLink ? { deepLink: result.history.deepLink } : {}),
+    ...(result.history.ideDeepLink ? { ideDeepLink: result.history.ideDeepLink } : {}),
   }));
   process.exitCode = result.exitCode;
 }

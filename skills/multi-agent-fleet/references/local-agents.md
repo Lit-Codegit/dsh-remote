@@ -26,7 +26,8 @@ default model unless a per-run change is authorized. A successful turn, not a ca
 name or the version string, establishes that the chosen combination works.
 
 The direct CLI examples below were checked against Codex CLI 0.150.1 and OpenCode 1.19.3;
-native section integration was checked with Codex CLI 0.166.0-alpha.6. They start a real
+native history integration was checked with Codex CLI 0.166.0-alpha.6 and the VS Code
+extension's 0.164.0-alpha.11.1 history query. They start a real
 agent and may use the configured provider; `--help`/`--version` alone are discovery.
 Choose the worker checkout and absolute run directory before using an example.
 
@@ -69,20 +70,22 @@ node "$repo_root/tools/codex-worker.mjs" \
 Create the task file outside a fresh run directory. For an explicitly authorized coding
 task, add `--sandbox workspace-write`; otherwise retain the CLI's configured permissions.
 The launcher keeps the original configuration directory, model and authentication. It saves
-the PID, events, result and exit status, and registers the original thread through the
-official section APIs. No additional model turn is used for registration.
+the PID, exact task snapshot, events, result and exit status. The official app-server first
+creates a persistent native `vscode` conversation without a model turn; `exec resume` then
+runs the real assignment in that same ID. No extra bootstrap prompt is sent.
 
-The normal Codex list filters out `exec` workers. The native section query includes them,
-so new workers are placed in the built-in Pinned section with a concise `DSH · <task>` title.
-Existing user section placement is retained. This changes organization metadata, not the
-thread source, ID, history or project files. A GUI refresh may be needed to update its cache.
+The normal Codex list filters out `exec` workers and empty previews. The launcher names the
+native conversation `DSH · <task>` and verifies the ordinary history query after the task
+creates its first real user turn. It never changes the source or switches thread IDs during
+execution. Existing user section placement is retained. Reopen the IDE history to refresh it.
+A section query that explicitly includes all sources does not match IDE history behavior.
 
 Only when the user explicitly asks to keep a task out of the GUI, add `--skip-history`.
 This skips native registration; it does not delete the CLI's ordinary local transcript.
-An unavailable section API is a pending integration failure, not permission to edit the
-database or pretend the GUI entry exists.
+An unavailable native API or a missing ordinary-history entry is a pending integration
+failure, not permission to edit the database or pretend the GUI entry exists.
 
-To register a worker produced by another launcher, or retry a pending entry:
+To verify a native `cli`/`vscode` worker produced by another launcher, or retry a pending entry:
 
 ```bash
 node "$repo_root/tools/codex-history.mjs" \
@@ -90,10 +93,18 @@ node "$repo_root/tools/codex-history.mjs" \
   --title "DSH · $task_title" --output "$run_dir/history.json"
 ```
 
-The helper verifies persistence using the same section/source filters as the GUI. Keep its
-returned ID and `codex://threads/<id>` link with the run. The explicit `--skip-history` helper
+The helper verifies persistence using ordinary history filters with `sourceKinds: []` and
+no section filter. Keep its returned ID and `vscode://openai.chatgpt/local/<id>` IDE link
+(or `codex://threads/<id>` desktop link) with the run. The explicit `--skip-history` helper
 option performs no Codex RPC operations. Metadata APIs do not provide visual inspection
-of the desktop UI; distinguish verified list inclusion from a user-confirmed rendered entry.
+of the UI; distinguish verified list inclusion from a user-confirmed rendered entry.
+
+An existing `exec` thread cannot be registered by changing its section. An official
+`thread/fork` import creates a new native ID and preserves the original. Use
+`deferGoalContinuation: true` to prevent automatic goal continuation. A fork can have an
+empty preview and remain hidden until it receives a real user turn; disclose any confirmation
+turn and verify the ordinary list afterward. Record both IDs and their links. Never rewrite
+source/preview fields in the database or rollout to bypass the filters.
 
 ### Direct CLI interface
 

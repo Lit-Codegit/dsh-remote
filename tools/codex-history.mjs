@@ -1,7 +1,7 @@
 #!/usr/bin/env node
 
 import { spawn } from 'node:child_process';
-import { access, mkdir, rename, writeFile } from 'node:fs/promises';
+import { access, mkdir, realpath, rename, writeFile } from 'node:fs/promises';
 import { constants } from 'node:fs';
 import path from 'node:path';
 import readline from 'node:readline';
@@ -22,7 +22,7 @@ async function findInPages(rpc, method, params, predicate) {
   let cursor = null;
   const seen = new Set();
   for (let page = 0; page < 100; page += 1) {
-    const result = await rpc.request(method, { ...params, cursor, limit: 100 });
+    const result = await rpc.request(method, { ...params, cursor, limit: 50 });
     const found = (result.data ?? []).find(predicate);
     if (found) return found;
     cursor = result.nextCursor;
@@ -33,7 +33,55 @@ async function findInPages(rpc, method, params, predicate) {
   throw new Error(`${method} exceeded the pagination limit`);
 }
 
-/** Register an existing worker through official metadata APIs; never start a model turn. */
+function requireNativeThread(thread) {
+  if (!['cli', 'vscode'].includes(thread?.source)) {
+    const source = typeof thread?.source === 'string' ? thread.source : 'non-interactive';
+    throw new Error(`Worker source ${source} is excluded from ordinary native history; an official native import is required. Section placement is not history integration.`);
+  }
+  if (thread.archived) throw new Error('Archived workers are excluded from ordinary native history');
+  if (thread.ephemeral) throw new Error('Ephemeral workers cannot be registered in native history');
+}
+
+function normalizedTitle(title, fallback) {
+  if (title === undefined) return fallback;
+  if (typeof title !== 'string' || !title.trim()) throw new Error('title must be non-empty');
+  return title.trim();
+}
+
+async function sameWorkspace(left, right) {
+  if (typeof left !== 'string' || typeof right !== 'string') return false;
+  if (path.resolve(left) === path.resolve(right)) return true;
+  try { return (await realpath(left)) === (await realpath(right)); } catch { return false; }
+}
+
+/** Create a durable native identity, without starting a model turn or claiming visibility. */
+export async function createNativeCodexThread({ rpc, cwd, title, sandbox } = {}) {
+  if (!rpc?.request) throw new Error('An app-server RPC client is required');
+  if (typeof cwd !== 'string' || !path.isAbsolute(cwd) || cwd.includes('\0')) throw new Error('cwd must be an absolute workspace directory');
+  if (sandbox !== undefined && !['read-only', 'workspace-write'].includes(sandbox)) {
+    throw new Error('Bootstrap sandbox must be read-only or workspace-write');
+  }
+  const name = normalizedTitle(title, 'DSH · Codex');
+  const created = (await rpc.request('thread/start', {
+    cwd, ephemeral: false, threadSource: 'user',
+    ...(sandbox === undefined ? {} : { sandbox }),
+  })).thread;
+  if (!UUID.test(created?.id ?? '')) throw new Error('thread/start did not return a valid native thread identity');
+  requireNativeThread(created);
+  if (!await sameWorkspace(created.cwd, cwd)) throw new Error('thread/start returned an unexpected workspace directory');
+  // Explicit naming materializes the identity before the creating process exits.
+  // A fresh thread may still have no preview until its first real worker turn.
+  await rpc.request('thread/name/set', { threadId: created.id, name });
+  const saved = (await rpc.request('thread/read', { threadId: created.id, includeTurns: false })).thread;
+  if (saved?.id !== created.id) throw new Error('Codex did not persist the native thread identity');
+  requireNativeThread(saved);
+  if (saved.source !== created.source) throw new Error('Native worker source changed unexpectedly');
+  if (!await sameWorkspace(saved.cwd, cwd)) throw new Error('Codex persisted an unexpected workspace directory');
+  if (saved.name !== name) throw new Error('Codex did not persist the worker title');
+  return { threadId: saved.id, source: saved.source, cwd: saved.cwd, name: saved.name };
+}
+
+/** Verify an existing worker against ordinary native history; never create a model turn. */
 export async function registerCodexHistory({
   rpc, threadId, title, skipHistory = false, attempts = 5, retryDelayMs = 300,
   sleepFn = (ms) => new Promise((resolve) => setTimeout(resolve, ms)),
@@ -42,7 +90,7 @@ export async function registerCodexHistory({
   if (skipHistory) return { integrated: false, reason: 'explicit-opt-out', threadId };
   if (!rpc?.request) throw new Error('An app-server RPC client is required');
   if (!Number.isInteger(attempts) || attempts < 1 || attempts > 20) throw new Error('attempts must be between 1 and 20');
-  if (title !== undefined && (typeof title !== 'string' || !title.trim())) throw new Error('title must be non-empty');
+  const name = normalizedTitle(title);
 
   let thread;
   // thread.started can precede rollout persistence. Only retry that specific race.
@@ -57,31 +105,29 @@ export async function registerCodexHistory({
     }
   }
 
-  const targetId = thread.section?.id ?? PINNED_SECTION_ID;
-  const pinned = await findInPages(rpc, 'threadSection/list', {}, (section) => section.id === targetId);
-  if (!pinned) throw new Error(targetId === PINNED_SECTION_ID
-    ? 'This Codex app-server does not expose the built-in Pinned section'
-    : 'The worker existing section is unavailable; preserving its placement');
-  const name = title?.trim();
+  // Native IDE history excludes exec/subagent sources. An all-sources section
+  // query can find those records while the user's ordinary history remains empty.
+  requireNativeThread(thread);
   if (name && thread.name !== name) await rpc.request('thread/name/set', { threadId, name });
-  if (thread.section?.id !== pinned.id) {
-    await rpc.request('thread/section/move', { threadId, sectionId: pinned.id });
-  }
 
   const saved = (await rpc.request('thread/read', { threadId, includeTurns: false })).thread;
-  if (saved?.id !== threadId || saved.section?.id !== pinned.id) throw new Error('Codex did not persist the worker section');
-  if (JSON.stringify(saved.source) !== JSON.stringify(thread.source)) throw new Error('Worker source changed unexpectedly');
+  if (saved?.id !== threadId) throw new Error('thread/read returned a different worker');
+  requireNativeThread(saved);
+  if (saved.source !== thread.source) throw new Error('Worker source changed unexpectedly');
   if (name && saved.name !== name) throw new Error('Codex did not persist the worker title');
 
-  // These are the native GUI section-list filters, including background exec workers.
+  // Match ordinary IDE history, including its default interactive-source filter.
+  // Source alone is insufficient: a missing preview can still hide a row.
   const visible = await findInPages(rpc, 'thread/list', {
-    sectionId: pinned.id, sourceKinds: ALL_SOURCES, modelProviders: [],
-    archived: false, useStateDbOnly: true,
+    sourceKinds: [], modelProviders: [], archived: false,
+    useStateDbOnly: true, sortKey: 'created_at',
   }, (item) => item.id === threadId);
-  if (!visible) throw new Error('Worker is not returned by the GUI-equivalent section query');
+  if (!visible) throw new Error('Worker is not returned by the ordinary native history query');
+  const deepLink = `codex://threads/${threadId}`;
   return {
-    integrated: true, threadId, sectionId: pinned.id, name: saved.name ?? null,
-    source: saved.source, cwd: saved.cwd, deepLink: `codex://threads/${threadId}`,
+    integrated: true, threadId, sectionId: saved.section?.id ?? null, name: saved.name ?? null,
+    source: saved.source, cwd: saved.cwd, deepLink, codexDeepLink: deepLink,
+    ideDeepLink: `vscode://openai.chatgpt/local/${threadId}`,
   };
 }
 

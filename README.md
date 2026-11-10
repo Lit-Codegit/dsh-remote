@@ -58,8 +58,8 @@ Serve 首次配置可能要求启用 tailnet 的 HTTPS；完整配置见 [bridge
 `multi-agent-fleet` 让 DSH 负责协调，由已安装的 Codex、OpenCode 等 CLI 执行任务。
 本机即可使用；独立任务分别记录任务文件、进程和结果，写入任务使用独立 worktree。
 沿用每个 agent 已有的模型、认证和权限设置，完成后由 DSH 检查改动与验证证据。
-Codex 任务默认通过 [`codex-worker.mjs`](tools/codex-worker.mjs) 接入原生界面的「置顶」，
-保留原会话 ID 和记录；只有用户明确要求时才用 `--skip-history` 跳过。
+Codex 任务默认通过 [`codex-worker.mjs`](tools/codex-worker.mjs) 创建原生会话，再在同一 ID 中执行任务，
+完成后核对 VS Code 扩展使用的普通历史列表；只有用户明确要求时才用 `--skip-history` 跳过。
 接入失败会记录在 `history.json` 并返回失败状态，方便重试。
 
 ## 三种用法

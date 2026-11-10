@@ -7,7 +7,6 @@ import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 
-import { PINNED_SECTION_ID } from '../codex-history.mjs';
 import { parseWorkerArgs, runCodexWorker } from '../codex-worker.mjs';
 
 const THREAD_ID = '11111111-1111-7111-a111-111111111111';
@@ -26,13 +25,18 @@ if (process.argv[2] === 'exec') {
   process.stdin.on('data', data => task += data);
   process.stdin.on('end', () => {
     fs.writeFileSync(path.join(dir, 'stdin.txt'), task);
-    const id = '${THREAD_ID}';
+    const resumeIndex = process.argv.indexOf('resume');
+    const id = process.env.FAKE_THREAD_ID ?? (resumeIndex < 0 ? '${THREAD_ID}' : process.argv[resumeIndex + 1]);
     process.stdout.write('not-json\\n' + JSON.stringify({type:'item.completed', thread_id:'22222222-2222-7222-a222-222222222222'}) + '\\n');
     const started = JSON.stringify({type:'thread.started',thread_id:id}) + '\\n';
     process.stdout.write(started.slice(0,13));
     setTimeout(() => {
       process.stdout.write(started.slice(13));
-      fs.writeFileSync(stateFile, JSON.stringify({id, source:'exec', cwd:process.cwd(), name:'old', section:null}));
+      const thread = fs.existsSync(stateFile) ? JSON.parse(fs.readFileSync(stateFile,'utf8'))
+        : {id, source:resumeIndex < 0 ? 'exec' : 'vscode', cwd:process.cwd(), name:'old', section:null};
+      thread.preview = task.split('\\n')[0];
+      fs.writeFileSync(stateFile, JSON.stringify(thread));
+      fs.writeFileSync(path.join(dir,'worker-started'),'yes');
       if (process.env.FAKE_INHERIT_PIPES) {
         const background = require('node:child_process').spawn(process.execPath, ['-e', 'setInterval(() => {}, 1000)'], {stdio:['ignore',process.stdout,process.stderr]});
         fs.writeFileSync(path.join(dir,'background.pid'),String(background.pid));
@@ -56,14 +60,20 @@ if (process.argv[2] === 'exec') {
     let result = {};
     let error;
     if (message.method === 'initialize') result = {userAgent:'fake'};
-    else if (process.env.FAKE_HISTORY_FAIL) error = {code:-32600,message:'metadata unavailable'};
+    else if (message.method === 'thread/start') {
+      if (process.env.FAKE_BOOTSTRAP_FAIL) error = {code:-32600,message:'bootstrap unavailable'};
+      else {
+        const thread = {id:'${THREAD_ID}',source:'vscode',cwd:message.params.cwd,name:null,section:null};
+        fs.writeFileSync(stateFile,JSON.stringify(thread));
+        result = {thread};
+      }
+    }
+    else if (process.env.FAKE_HISTORY_FAIL && fs.existsSync(path.join(dir,'worker-started'))) error = {code:-32600,message:'metadata unavailable'};
     else {
       const thread = JSON.parse(fs.readFileSync(stateFile,'utf8'));
       switch (message.method) {
         case 'thread/read': result={thread}; break;
-        case 'threadSection/list': result={data:[{id:'${PINNED_SECTION_ID}',name:'Pinned'}],nextCursor:null}; break;
         case 'thread/name/set': thread.name=message.params.name; break;
-        case 'thread/section/move': thread.section={id:message.params.sectionId,name:'Pinned'}; break;
         case 'thread/list': result={data:[thread],nextCursor:null}; break;
         default: error={code:-32601,message:'forbidden fake API: '+message.method};
       }
@@ -109,6 +119,15 @@ function argv(options) {
   return ['--cwd', options.cwd, '--task', options.task, '--run-dir', options.runDir, '--codex-bin', options.codexBin];
 }
 
+function nativeDependencies(f, overrides = {}) {
+  return {
+    env: f.env,
+    createRpc: () => ({ async initialize() {}, async close() {} }),
+    createNativeThread: async ({ cwd, title }) => ({ threadId: THREAD_ID, source: 'vscode', cwd, name: title }),
+    ...overrides,
+  };
+}
+
 test('actual wrapper CLI spawns a fake worker and automatically registers its original ID in native history', async (t) => {
   const f = await fixture(t, { CODEX_HOME: '/unchanged/configured/home' });
   const outcome = await launch(argv(f.options), f.env).done;
@@ -116,12 +135,14 @@ test('actual wrapper CLI spawns a fake worker and automatically registers its or
   const summary = JSON.parse(outcome.stdout);
   assert.equal(summary.threadId, THREAD_ID);
   assert.equal(summary.deepLink, `codex://threads/${THREAD_ID}`);
+  assert.equal(summary.ideDeepLink, `vscode://openai.chatgpt/local/${THREAD_ID}`);
   assert.equal(summary.history, 'integrated');
   assert.ok(!outcome.stdout.includes('Private task body'));
   assert.equal(await readFile(path.join(f.state, 'stdin.txt'), 'utf8'), await readFile(f.options.task, 'utf8'));
   const invocations = (await readFile(path.join(f.state, 'invocations.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
-  assert.equal(invocations[0].codexHome, '/unchanged/configured/home');
-  assert.deepEqual(invocations[0].args, ['exec', '-C', f.options.cwd, '--json', '-o', path.join(f.options.runDir, 'result.md'), '-']);
+  const worker = invocations.find((item) => item.kind === 'exec');
+  assert.equal(worker.codexHome, '/unchanged/configured/home');
+  assert.deepEqual(worker.args, ['exec', '--json', '-o', path.join(f.options.runDir, 'result.md'), 'resume', THREAD_ID, '-']);
   assert.equal(invocations.filter((item) => item.kind === 'exec').length, 1);
   const run = await f.readJson('run.json');
   assert.equal(run.threadId, THREAD_ID);
@@ -133,11 +154,14 @@ test('actual wrapper CLI spawns a fake worker and automatically registers its or
   assert.deepEqual(run.history, { enabled: true, defaultEnabled: true, explicitOptOut: false });
   const history = await f.readJson('history.json');
   assert.equal(history.name, 'DSH · 小项目');
-  assert.equal(history.source, 'exec');
+  assert.equal(history.source, 'vscode');
   assert.equal(history.integrated, true);
   const calls = await f.calls();
-  assert.ok(calls.some((item) => item.method === 'thread/section/move'));
-  assert.ok(calls.every((item) => ['initialize', 'initialized', 'thread/read', 'threadSection/list', 'thread/name/set', 'thread/section/move', 'thread/list'].includes(item.method)));
+  assert.deepEqual(calls.find((item) => item.method === 'thread/start').params, {
+    cwd: f.options.cwd, ephemeral: false, threadSource: 'user',
+  });
+  assert.ok(calls.some((item) => item.method === 'thread/list' && item.params.sourceKinds.length === 0));
+  assert.ok(calls.every((item) => ['initialize', 'initialized', 'thread/start', 'thread/read', 'thread/name/set', 'thread/list'].includes(item.method)));
   assert.equal((await f.readJson('exit.json')).workerExitCode, 0);
   assert.match(await readFile(path.join(f.options.runDir, 'worker.events.jsonl'), 'utf8'), /not-json/);
   assert.equal(await readFile(path.join(f.options.runDir, 'worker.stderr.log'), 'utf8'), 'worker diagnostics\n');
@@ -162,8 +186,8 @@ test('explicit opt-out starts no metadata client and retains the worker exit cod
 test('a worker failure remains the wrapper exit code even if history registration fails', async (t) => {
   const f = await fixture(t, { FAKE_EXIT: '17' });
   const result = await runCodexWorker(f.options, {
-    env: f.env,
-    createRpc: () => ({ async initialize() { throw new Error('metadata unavailable'); }, async close() {} }),
+    ...nativeDependencies(f),
+    async registerHistory() { throw new Error('metadata unavailable'); },
   });
   assert.equal(result.exitCode, 17);
   assert.equal(result.workerExitCode, 17);
@@ -176,11 +200,8 @@ test('successful worker with failed default history registration records pending
   const f = await fixture(t);
   let calls = 0;
   const result = await runCodexWorker(f.options, {
-    env: f.env,
-    createRpc: () => ({
-      async initialize() { calls += 1; throw new Error('metadata unavailable'); },
-      async close() {},
-    }),
+    ...nativeDependencies(f),
+    async registerHistory() { calls += 1; throw new Error('metadata unavailable'); },
   });
   assert.equal(result.exitCode, 3);
   assert.equal(result.workerExitCode, 0);
@@ -194,9 +215,8 @@ test('registration starts while the worker runs and retries once after an initia
   const f = await fixture(t, { FAKE_DELAY: '150' });
   let count = 0;
   let firstPid;
-  const createRpc = () => ({ async initialize() {}, async close() {} });
   const result = await runCodexWorker(f.options, {
-    env: f.env, createRpc,
+    ...nativeDependencies(f),
     async registerHistory({ threadId, title }) {
       count += 1;
       if (count === 1) {
@@ -212,6 +232,32 @@ test('registration starts while the worker runs and retries once after an initia
   assert.equal(result.exitCode, 0);
   assert.equal(count, 2);
   assert.equal(result.history.attempts, 2);
+});
+
+test('an early successful registration is rechecked after exit and becomes pending when the final query loses the ID', async (t) => {
+  const f = await fixture(t, { FAKE_DELAY: '150' });
+  let calls = 0;
+  let pid;
+  const result = await runCodexWorker(f.options, nativeDependencies(f, {
+    async registerHistory({ threadId }) {
+      calls += 1;
+      if (calls === 1) {
+        pid = (await f.readJson('run.json')).pid;
+        assert.doesNotThrow(() => process.kill(pid, 0));
+        return { integrated: true, threadId, deepLink: `codex://threads/${threadId}` };
+      }
+      assert.throws(() => process.kill(pid, 0), { code: 'ESRCH' });
+      assert.equal((await f.readJson('history.json')).integrated, true, 'early visibility remains recorded until the final query');
+      throw new Error('The ordinary native history query did not return the worker ID');
+    },
+  }));
+  assert.equal(calls, 2);
+  assert.equal(result.workerExitCode, 0);
+  assert.equal(result.exitCode, 3);
+  assert.equal(result.history.state, 'pending');
+  assert.equal(result.history.integrated, false);
+  assert.match((await f.readJson('history.json')).error, /native history query/);
+  assert.equal((await f.readJson('exit.json')).exitCode, 3);
 });
 
 test('existing evidence rejects a run before any worker spawn and preserves its bytes', async (t) => {
@@ -241,7 +287,7 @@ test('a spawn failure writes exit evidence and does not attempt metadata registr
   const f = await fixture(t);
   await writeFile(f.options.codexBin, '#!/no/such/fake-interpreter\n');
   let metadataCalls = 0;
-  const result = await runCodexWorker(f.options, {
+  const result = await runCodexWorker({ ...f.options, skipHistory: true }, {
     env: f.env, createRpc() { metadataCalls += 1; throw new Error('must not start'); },
   });
   assert.equal(result.exitCode, 1);
@@ -249,6 +295,80 @@ test('a spawn failure writes exit evidence and does not attempt metadata registr
   assert.equal(metadataCalls, 0);
   assert.match(result.error, /ENOENT/);
   assert.equal((await f.readJson('exit.json')).exitCode, 1);
+});
+
+test('a failed native bootstrap never spawns exec and records an incomplete delivery', async (t) => {
+  const f = await fixture(t);
+  let spawned = false;
+  const result = await runCodexWorker(f.options, nativeDependencies(f, {
+    async createNativeThread() { throw new Error('bootstrap unavailable'); },
+    spawnFn() { spawned = true; throw new Error('must not spawn'); },
+  }));
+  assert.equal(spawned, false);
+  assert.equal(result.workerExitCode, null);
+  assert.equal(result.exitCode, 3);
+  assert.equal(result.history.stage, 'bootstrap');
+  assert.match((await f.readJson('exit.json')).error, /bootstrap unavailable/);
+});
+
+test('actual CLI bootstrap failure exits 3 without starting a worker', async (t) => {
+  const f = await fixture(t, { FAKE_BOOTSTRAP_FAIL: '1' });
+  const outcome = await launch(argv(f.options), f.env).done;
+  assert.equal(outcome.code, 3, outcome.stderr);
+  const invocations = (await readFile(path.join(f.state, 'invocations.jsonl'), 'utf8')).trim().split('\n').map(JSON.parse);
+  assert.ok(invocations.every((item) => item.kind === 'metadata'));
+  assert.equal((await f.readJson('exit.json')).workerExitCode, null);
+});
+
+test('an explicit sandbox is passed to native creation and to the exec parent flags', async (t) => {
+  const f = await fixture(t);
+  let bootstrapOptions;
+  const result = await runCodexWorker({ ...f.options, sandbox: 'read-only' }, nativeDependencies(f, {
+    async createNativeThread(options) {
+      bootstrapOptions = options;
+      return { threadId: THREAD_ID, source: 'vscode', cwd: options.cwd };
+    },
+    async registerHistory({ threadId }) { return { integrated: true, threadId }; },
+  }));
+  assert.equal(result.exitCode, 0);
+  assert.deepEqual(Object.keys(bootstrapOptions).sort(), ['cwd', 'rpc', 'sandbox', 'title']);
+  assert.equal(bootstrapOptions.sandbox, 'read-only');
+  const invocation = JSON.parse((await readFile(path.join(f.state, 'invocations.jsonl'), 'utf8')).trim());
+  assert.deepEqual(invocation.args, [
+    'exec', '--json', '-o', path.join(f.options.runDir, 'result.md'),
+    '--sandbox', 'read-only', 'resume', THREAD_ID, '-',
+  ]);
+});
+
+test('a worker reporting a different thread is interrupted without registering the wrong ID', async (t) => {
+  const otherId = '22222222-2222-7222-a222-222222222222';
+  const f = await fixture(t, { FAKE_THREAD_ID: otherId, FAKE_DELAY: '10000' });
+  let registrations = 0;
+  const result = await runCodexWorker(f.options, nativeDependencies(f, {
+    async registerHistory() { registrations += 1; throw new Error('must not register'); },
+  }));
+  assert.equal(result.threadId, THREAD_ID);
+  assert.equal(result.exitCode, 143);
+  assert.equal(registrations, 0);
+  assert.equal((await f.readJson('run.json')).reportedThreadId, otherId);
+  assert.match(result.evidenceError, /different thread/);
+});
+
+test('bootstrap rejects a noninteractive source or different cwd before sending the task to exec', async (t) => {
+  const f = await fixture(t);
+  for (const [index, native] of [
+    { threadId: THREAD_ID, source: 'exec', cwd: f.options.cwd },
+    { threadId: THREAD_ID, source: 'vscode', cwd: f.directory },
+  ].entries()) {
+    let spawned = false;
+    const result = await runCodexWorker({ ...f.options, runDir: path.join(f.directory, `rejected-${index}`) }, nativeDependencies(f, {
+      async createNativeThread() { return native; },
+      spawnFn() { spawned = true; throw new Error('must not spawn'); },
+    }));
+    assert.equal(spawned, false);
+    assert.equal(result.exitCode, 3);
+    assert.equal(result.workerExitCode, null);
+  }
 });
 
 test('an existing empty run directory is private before the worker writes its result', async (t) => {
